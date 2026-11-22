@@ -502,7 +502,7 @@ int main(int argc, char **argv) {
     enc->time_base = (AVRational){1, 90000};
     enc->framerate = (AVRational){DEFAULT_FPS, 1};
     enc->pix_fmt = AV_PIX_FMT_VAAPI;
-    enc->gop_size = 180; // 3 seconds at 60fps: eliminates 250ms IDR packet burst storms
+    enc->gop_size = 15;
     enc->max_b_frames = 0;
 
     AVBufferRef *hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
@@ -515,15 +515,14 @@ int main(int argc, char **argv) {
     av_hwframe_ctx_init(hw_frames_ref);
     enc->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
 
-    // Ultra-low latency tailor-made compression options
-    av_opt_set(enc->priv_data, "low_power", "1", 0); // Intel VDENC fixed-function ASIC
-    av_opt_set(enc->priv_data, "profile", "578", 0);  // Constrained Baseline (CHP)
-    av_opt_set(enc->priv_data, "coder", "cavlc", 0);  // Zero arithmetic dependency stalls on TV VPU
-    av_opt_set(enc->priv_data, "quality", "7", 0);    // Fastest single hardware pass
-    av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);  // Zero lookahead, zero VBV buffer latency
-    av_opt_set(enc->priv_data, "qp", "26", 0);       // Pristine text sharpness without blocking
-    av_opt_set(enc->priv_data, "sei", "0", 0);       // Strip buffering_period/pic_timing (eliminates HRD delay)
-    av_opt_set(enc->priv_data, "async_depth", "1", 0);// Strictly 1 frame in flight
+    // Ultra-low latency options
+    av_opt_set(enc->priv_data, "low_power", "1", 0);
+    av_opt_set(enc->priv_data, "profile", "578", 0);
+    av_opt_set(enc->priv_data, "coder", "cavlc", 0);
+    av_opt_set(enc->priv_data, "quality", "7", 0);
+    av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
+    av_opt_set(enc->priv_data, "qp", "28", 0);
+    av_opt_set(enc->priv_data, "async_depth", "1", 0);
     // Note: Do NOT set "aud" here: Intel driver's aud corrupts slice byte-alignment!
     // The MPEG-TS muxer automatically generates and inserts valid AUDs into each PES packet.
 
@@ -573,26 +572,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: Could not open RTP UDP output (%d)\n", err);
         return 1;
     }
-
-    // Apply Wi-Fi Multimedia (WMM) AC_VO (Voice/Ultra-low latency) QoS to RTP socket
-    for (int sfd = 3; sfd < 256; sfd++) {
-        struct sockaddr_in sin;
-        socklen_t slen = sizeof(sin);
-        if (getsockname(sfd, (struct sockaddr *)&sin, &slen) == 0) {
-            if (sin.sin_family == AF_INET && ntohs(sin.sin_port) == g_local_rtp_port) {
-                int prio = 6; // Voice / Highest Priority Access Category (AC_VO)
-                setsockopt(sfd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
-                int tos = 0xb8; // DSCP Expedited Forwarding (EF)
-                setsockopt(sfd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-                int sndbuf = 256 * 1024;
-                setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-                printf("[FluxCast-C Network] Socket fd %d on port %d: Applied SO_PRIORITY=6 (WMM AC_VO), IP_TOS=0xb8 (DSCP EF)\n",
-                       sfd, g_local_rtp_port);
-                break;
-            }
-        }
-    }
-
     if (avformat_write_header(out_ctx, NULL) < 0) {
         fprintf(stderr, "Error: Failed to write RTP MPEG-TS header\n");
         return 1;
