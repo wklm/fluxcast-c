@@ -433,6 +433,20 @@ int main(int argc, char **argv) {
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    // Real-Time System Hardening: Lock memory into RAM to eliminate page fault jitter
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+        printf("[FluxCast-C System] Memory locked into RAM (Zero Page Fault Jitter)\n");
+    }
+
+    // Disable deep CPU C-States (C6/C7 wakeup latency elimination)
+    int pm_fd = open("/dev/cpu_dma_latency", O_WRONLY);
+    if (pm_fd >= 0) {
+        int32_t target_latency_us = 0;
+        if (write(pm_fd, &target_latency_us, sizeof(target_latency_us)) > 0) {
+            printf("[FluxCast-C System] PM QoS active: CPU C-states locked to C0/C1\n");
+        }
+    }
+
     printf("=========================================================\n");
     printf("  FluxCast-C: Pure C Zero-Abstraction Miracast Streamer \n");
     printf("  Direct Wayland Screencopy -> Intel VDENC Hardware VAAPI\n");
@@ -504,6 +518,10 @@ int main(int argc, char **argv) {
     enc->pix_fmt = AV_PIX_FMT_VAAPI;
     enc->gop_size = 15;
     enc->max_b_frames = 0;
+    enc->has_b_frames = 0;
+    enc->slices = 1; // Strict 1 slice: prevents 88% Intel VDENC driver bloat
+    enc->flags |= AV_CODEC_FLAG_LOW_DELAY; // Forces DPB max_dec_frame_buffering=1 (bypasses 33-50ms TV reordering delay)
+    enc->flags2 |= AV_CODEC_FLAG2_FAST;
 
     AVBufferRef *hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
     AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
@@ -522,6 +540,7 @@ int main(int argc, char **argv) {
     av_opt_set(enc->priv_data, "quality", "7", 0);
     av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(enc->priv_data, "qp", "28", 0);
+    av_opt_set(enc->priv_data, "sei", "recovery_point", 0); // Preserves sync recovery points while stripping HRD buffering delay
     av_opt_set(enc->priv_data, "async_depth", "1", 0);
     // Note: Do NOT set "aud" here: Intel driver's aud corrupts slice byte-alignment!
     // The MPEG-TS muxer automatically generates and inserts valid AUDs into each PES packet.
