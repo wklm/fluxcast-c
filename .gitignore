@@ -6,3 +6,5 @@ bin/
 *.mp4
 *.log
 .DS_Store
+.pi/
+query_va_caps

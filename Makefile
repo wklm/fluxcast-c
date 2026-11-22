@@ -23,9 +23,10 @@ install: $(BIN)
 
 tools:
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/test_capture_speed.c src/wlr-screencopy-unstable-v1-protocol.c -o bin/test_capture_speed $(PKG_LIBS)
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_capture_speed.c src/wlr-screencopy-unstable-v1-protocol.c -o bin/test_capture_speed $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/test_fast_nv12.c -o bin/test_fast_nv12 $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/inspect_pkt3.c -o bin/inspect_pkt3 $(PKG_LIBS)
+	$(CC) $(CFLAGS) tools/query_va_caps.c -o bin/query_va_caps -lva -lva-drm
 	@echo "Tools built in bin/"
 
 clean:
