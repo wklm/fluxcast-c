@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <va/va.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
@@ -107,6 +108,28 @@ int video_enc_receive_packet(VideoEncoder *enc, AVPacket *pkt);
  * Returns 0 on success, negative AV error code on failure.
  */
 int video_enc_encode(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts, AVPacket *pkt);
+
+/*
+ * Retrieve the underlying VADisplay handle from the hardware device context.
+ */
+VADisplay video_enc_get_va_display(const VideoEncoder *enc);
+
+/*
+ * Acquire a hardware NV12 surface from the encoder's preallocated pool.
+ * Does not perform any software DMA upload.
+ * Sets *out_surface to the underlying VASurfaceID.
+ *
+ * Returns 0 on success, negative AV error code on failure.
+ */
+int video_enc_get_hw_surface(VideoEncoder *enc, VASurfaceID *out_surface);
+
+/*
+ * Submit the previously acquired hardware surface directly to the VDENC ASIC.
+ * Records last_dma_time_us = 0, last_send_time_us, and last_hw_time_us.
+ *
+ * Returns 0 on success, negative AV error code on failure.
+ */
+int video_enc_send_hw_surface(VideoEncoder *enc, int64_t pts);
 
 /*
  * Drain remaining packets after flushing.

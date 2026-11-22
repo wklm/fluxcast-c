@@ -5,6 +5,7 @@
 #include <time.h>
 #include <libavutil/error.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/hwcontext_vaapi.h>
 
 static inline int64_t get_time_us(void) {
     struct timespec ts;
@@ -238,6 +239,42 @@ int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts) {
 
     av_frame_unref(enc->hw_frame);
 
+    return err;
+}
+
+VADisplay video_enc_get_va_display(const VideoEncoder *enc) {
+    if (!enc || !enc->hw_device_ctx) return NULL;
+    AVHWDeviceContext *hwdev = (AVHWDeviceContext *)enc->hw_device_ctx->data;
+    if (hwdev->type != AV_HWDEVICE_TYPE_VAAPI) return NULL;
+    AVVAAPIDeviceContext *va_ctx = (AVVAAPIDeviceContext *)hwdev->hwctx;
+    return va_ctx ? va_ctx->display : NULL;
+}
+
+int video_enc_get_hw_surface(VideoEncoder *enc, VASurfaceID *out_surface) {
+    if (!enc || !enc->codec_ctx || !enc->hw_frames_ref || !enc->hw_frame) {
+        return AVERROR(EINVAL);
+    }
+    int err = av_hwframe_get_buffer(enc->hw_frames_ref, enc->hw_frame, 0);
+    if (err < 0) return err;
+    if (out_surface) {
+        *out_surface = (VASurfaceID)(uintptr_t)enc->hw_frame->data[3];
+    }
+    return 0;
+}
+
+int video_enc_send_hw_surface(VideoEncoder *enc, int64_t pts) {
+    if (!enc || !enc->codec_ctx || !enc->hw_frame) {
+        return AVERROR(EINVAL);
+    }
+    enc->hw_frame->pts = pts;
+    enc->last_dma_time_us = 0; // Zero-copy: 0 us host-to-device upload
+
+    int64_t t_send0 = get_time_us();
+    int err = avcodec_send_frame(enc->codec_ctx, enc->hw_frame);
+    int64_t t_send1 = get_time_us();
+    enc->last_send_time_us = (t_send1 - t_send0);
+
+    av_frame_unref(enc->hw_frame);
     return err;
 }
 

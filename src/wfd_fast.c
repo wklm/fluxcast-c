@@ -23,6 +23,8 @@
 
 #include <wayland-client.h>
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "dmabuf_capture.h"
 #include "realtime_sys.h"
 #include "video_enc.h"
 #include "net_pacer.h"
@@ -61,6 +63,7 @@ static char g_local_ip[64] = "192.168.179.200";
 static int g_local_rtp_port = 19002;
 static char g_session_id[32] = "3829104";
 static bool g_stream_only = false;
+static bool g_no_dmabuf = false;
 
 static void handle_signal(int sig) {
     g_exit_signal = sig;
@@ -83,6 +86,7 @@ struct wayland_context {
     struct wl_registry *registry;
     struct wl_shm *shm;
     struct zwlr_screencopy_manager_v1 *screencopy_mgr;
+    struct zwp_linux_dmabuf_v1 *dmabuf_mgr;
     struct wl_output *output;
     uint32_t shm_format;
     int width, height, stride;
@@ -236,12 +240,20 @@ static void frame_handle_failed(void *data, struct zwlr_screencopy_frame_v1 *fra
     struct wayland_context *ctx = (struct wayland_context *)data;
     ctx->frame_failed = true;
 }
+static void frame_handle_damage(void *data, struct zwlr_screencopy_frame_v1 *frame,
+        uint32_t x, uint32_t y, uint32_t width, uint32_t height) {}
+static void frame_handle_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *frame,
+        uint32_t format, uint32_t width, uint32_t height) {}
+static void frame_handle_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *frame) {}
 
 static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
     .buffer = frame_handle_buffer,
     .flags = frame_handle_flags,
     .ready = frame_handle_ready,
     .failed = frame_handle_failed,
+    .damage = frame_handle_damage,
+    .linux_dmabuf = frame_handle_linux_dmabuf,
+    .buffer_done = frame_handle_buffer_done,
 };
 
 static void registry_handle_global(void *data, struct wl_registry *registry,
@@ -250,7 +262,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     if (strcmp(interface, wl_shm_interface.name) == 0) {
         ctx->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
     } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
-        ctx->screencopy_mgr = wl_registry_bind(registry, name, &zwlr_screencopy_manager_v1_interface, 1);
+        ctx->screencopy_mgr = wl_registry_bind(registry, name, &zwlr_screencopy_manager_v1_interface, (version >= 3) ? 3 : version);
+    } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+        ctx->dmabuf_mgr = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, (version >= 3) ? 3 : version);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (!ctx->output) {
             ctx->output = wl_registry_bind(registry, name, &wl_output_interface, 1);
@@ -516,6 +530,8 @@ int main(int argc, char **argv) {
             strncpy(g_local_ip, argv[++i], sizeof(g_local_ip) - 1);
         } else if (strcmp(argv[i], "--local-port") == 0 && i + 1 < argc) {
             g_local_rtp_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-dmabuf") == 0) {
+            g_no_dmabuf = true;
         }
     }
 
@@ -525,6 +541,7 @@ int main(int argc, char **argv) {
     AVFormatContext *out_ctx = NULL;
     AVFrame *sw_frame = NULL;
     AVPacket *pkt = NULL;
+    DmaBufCapture *dmabuf_cap = NULL;
     int timer_fd = -1;
 
     avformat_network_init();
@@ -588,6 +605,26 @@ int main(int argc, char **argv) {
     venc_initialized = true;
     enc = venc.codec_ctx;
     printf("[FluxCast-C Encoder] Intel QuickSync VDENC ASIC engaged at %dx%d@%d!\n", WIDTH, HEIGHT, DEFAULT_FPS);
+
+    if (!g_no_dmabuf && g_wl.screencopy_mgr && g_wl.dmabuf_mgr) {
+        DmaBufCaptureConfig cap_cfg = {
+            .display = g_wl.display,
+            .screencopy_mgr = g_wl.screencopy_mgr,
+            .dmabuf_mgr = g_wl.dmabuf_mgr,
+            .output = g_wl.output,
+            .va_display = video_enc_get_va_display(&venc),
+            .drm_node = "/dev/dri/renderD128",
+            .width = WIDTH,
+            .height = HEIGHT,
+        };
+        if (dmabuf_capture_create(&dmabuf_cap, &cap_cfg) == 0) {
+            printf("[FluxCast-C Wayland] Zero-Copy DMA-BUF Direct Import & Intel Hardware VPP engaged!\n");
+        } else {
+            printf("[FluxCast-C Wayland] DMA-BUF capture initialization failed; falling back to SHM+AVX2.\n");
+        }
+    } else if (g_no_dmabuf) {
+        printf("[FluxCast-C Wayland] DMA-BUF disabled via --no-dmabuf; using SHM+AVX2 pipeline.\n");
+    }
 
     // 4. Initialize Network Pacer & WMM Voice QoS
     net_pacer_cfg_t pacer_cfg = {
@@ -694,75 +731,127 @@ int main(int argc, char **argv) {
 
         net_pacer_frame_begin(&g_pacer);
 
-        g_wl.frame_ready = false;
-        g_wl.frame_failed = false;
-        g_wl.copy_done = false;
+        double t_capture_us = 0;
+        double t_convert_us = 0;
 
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-        struct zwlr_screencopy_frame_v1 *sc_frame =
-            zwlr_screencopy_manager_v1_capture_output(g_wl.screencopy_mgr, 1, g_wl.output);
-        if (!sc_frame) {
-            fprintf(stderr, "[FluxCast-C Wayland] Failed to create screencopy frame\n");
-            continue;
-        }
-        zwlr_screencopy_frame_v1_add_listener(sc_frame, &frame_listener, &g_wl);
+        if (dmabuf_cap) {
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            int cap_ret = dmabuf_capture_frame(dmabuf_cap);
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+            t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
 
-        if (wl_display_flush(g_wl.display) < 0 && errno != EAGAIN) {
-            if (errno != EINTR) {
-                fprintf(stderr, "[FluxCast-C Wayland] Display flush failed: %s\n", strerror(errno));
-                g_running = 0;
-                zwlr_screencopy_frame_v1_destroy(sc_frame);
-                break;
+            if (cap_ret < 0) {
+                static uint32_t dmabuf_fail_cnt = 0;
+                if (++dmabuf_fail_cnt % 300 == 1) {
+                    fprintf(stderr, "[FluxCast-C Wayland] DMA-BUF screencopy capture failed (e.g. DPMS / blanking, count=%u)\n",
+                            dmabuf_fail_cnt);
+                }
+                continue;
             }
-        }
 
-        while (!g_wl.frame_ready && !g_wl.frame_failed && g_running) {
-            if (wl_display_dispatch(g_wl.display) < 0) {
-                if (errno == EINTR) continue;
-                int wl_err = wl_display_get_error(g_wl.display);
-                fprintf(stderr, "[FluxCast-C Wayland] Fatal display connection error: %s (code %d, errno %d)\n",
-                        strerror(wl_err ? wl_err : errno), wl_err, errno);
-                g_running = 0;
-                break;
+            // Hardware VPP color conversion (XRGB -> NV12 in GPU hardware, ~0.24ms)
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            VASurfaceID dst_surface;
+            err = video_enc_get_hw_surface(&venc, &dst_surface);
+            if (err < 0) {
+                static int hw_buf_err_cnt = 0;
+                if (++hw_buf_err_cnt % 60 == 1) {
+                    fprintf(stderr, "[FluxCast-C Encoder] video_enc_get_hw_surface failed: %d\n", err);
+                }
+                continue;
             }
-        }
-        zwlr_screencopy_frame_v1_destroy(sc_frame);
-
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
-
-        if (g_wl.frame_failed || !g_wl.frame_ready) {
-            static uint32_t failed_consecutive = 0;
-            failed_consecutive++;
-            if (failed_consecutive == 1 || failed_consecutive % 300 == 0) {
-                fprintf(stderr, "[FluxCast-C Wayland] Screencopy capture failed (e.g. DPMS / display blanking, count=%u)\n",
-                        failed_consecutive);
+            err = dmabuf_capture_convert_vpp(dmabuf_cap, dst_surface);
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+            t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+            if (err < 0) {
+                static int vpp_err_cnt = 0;
+                if (++vpp_err_cnt % 60 == 1) {
+                    fprintf(stderr, "[FluxCast-C Wayland] dmabuf_capture_convert_vpp failed: %d\n", err);
+                }
+                continue;
             }
-            continue;
-        }
 
-        // Ultra-low latency AVX2 conversion from Wayland SHM buffer to NV12 sw_frame
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-        int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~7) : WIDTH;
-        int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
-        int stride_pixels = g_wl.stride / 4;
-        xrgb_to_nv12_ultra((const uint32_t *)g_wl.bufs[g_wl.cur_buf].data, conv_w, conv_h, stride_pixels,
-                          sw_frame->data[0], sw_frame->linesize[0],
-                          sw_frame->data[1], sw_frame->linesize[1]);
-
-        g_wl.cur_buf ^= 1;
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
-
-        // Hardware encode (DMA upload + Intel VDENC ASIC)
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-        err = video_enc_send_frame(&venc, sw_frame, pts);
-        if (err < 0) {
-            static int hw_buf_err_cnt = 0;
-            if (++hw_buf_err_cnt % 60 == 1) {
-                fprintf(stderr, "[FluxCast-C Encoder] video_enc_send_frame failed: %d\n", err);
+            // Hardware encode (Intel VDENC ASIC direct submit)
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            err = video_enc_send_hw_surface(&venc, pts);
+            if (err < 0) {
+                static int hw_enc_err_cnt = 0;
+                if (++hw_enc_err_cnt % 60 == 1) {
+                    fprintf(stderr, "[FluxCast-C Encoder] video_enc_send_hw_surface failed: %d\n", err);
+                }
+                continue;
             }
-            continue;
+        } else {
+            g_wl.frame_ready = false;
+            g_wl.frame_failed = false;
+            g_wl.copy_done = false;
+
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            struct zwlr_screencopy_frame_v1 *sc_frame =
+                zwlr_screencopy_manager_v1_capture_output(g_wl.screencopy_mgr, 1, g_wl.output);
+            if (!sc_frame) {
+                fprintf(stderr, "[FluxCast-C Wayland] Failed to create screencopy frame\n");
+                continue;
+            }
+            zwlr_screencopy_frame_v1_add_listener(sc_frame, &frame_listener, &g_wl);
+
+            if (wl_display_flush(g_wl.display) < 0 && errno != EAGAIN) {
+                if (errno != EINTR) {
+                    fprintf(stderr, "[FluxCast-C Wayland] Display flush failed: %s\n", strerror(errno));
+                    g_running = 0;
+                    zwlr_screencopy_frame_v1_destroy(sc_frame);
+                    break;
+                }
+            }
+
+            while (!g_wl.frame_ready && !g_wl.frame_failed && g_running) {
+                if (wl_display_dispatch(g_wl.display) < 0) {
+                    if (errno == EINTR) continue;
+                    int wl_err = wl_display_get_error(g_wl.display);
+                    fprintf(stderr, "[FluxCast-C Wayland] Fatal display connection error: %s (code %d, errno %d)\n",
+                            strerror(wl_err ? wl_err : errno), wl_err, errno);
+                    g_running = 0;
+                    break;
+                }
+            }
+            zwlr_screencopy_frame_v1_destroy(sc_frame);
+
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+            t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+
+            if (g_wl.frame_failed || !g_wl.frame_ready) {
+                static uint32_t failed_consecutive = 0;
+                failed_consecutive++;
+                if (failed_consecutive == 1 || failed_consecutive % 300 == 0) {
+                    fprintf(stderr, "[FluxCast-C Wayland] Screencopy capture failed (e.g. DPMS / display blanking, count=%u)\n",
+                            failed_consecutive);
+                }
+                continue;
+            }
+
+            // Ultra-low latency AVX2 conversion from Wayland SHM buffer to NV12 sw_frame
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~7) : WIDTH;
+            int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
+            int stride_pixels = g_wl.stride / 4;
+            xrgb_to_nv12_ultra((const uint32_t *)g_wl.bufs[g_wl.cur_buf].data, conv_w, conv_h, stride_pixels,
+                              sw_frame->data[0], sw_frame->linesize[0],
+                              sw_frame->data[1], sw_frame->linesize[1]);
+
+            g_wl.cur_buf ^= 1;
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+            t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+
+            // Hardware encode (DMA upload + Intel VDENC ASIC)
+            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            err = video_enc_send_frame(&venc, sw_frame, pts);
+            if (err < 0) {
+                static int hw_buf_err_cnt = 0;
+                if (++hw_buf_err_cnt % 60 == 1) {
+                    fprintf(stderr, "[FluxCast-C Encoder] video_enc_send_frame failed: %d\n", err);
+                }
+                continue;
+            }
         }
 
         while (video_enc_receive_packet(&venc, pkt) == 0) {
@@ -856,6 +945,10 @@ teardown:
     if (sw_frame) {
         av_frame_free(&sw_frame);
     }
+    if (dmabuf_cap) {
+        dmabuf_capture_destroy(dmabuf_cap);
+        dmabuf_cap = NULL;
+    }
     if (venc_initialized) {
         video_enc_close(&venc);
     }
@@ -876,6 +969,10 @@ teardown:
     if (g_wl.screencopy_mgr) {
         zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
         g_wl.screencopy_mgr = NULL;
+    }
+    if (g_wl.dmabuf_mgr) {
+        zwp_linux_dmabuf_v1_destroy(g_wl.dmabuf_mgr);
+        g_wl.dmabuf_mgr = NULL;
     }
     if (g_wl.output) {
         wl_output_destroy(g_wl.output);
