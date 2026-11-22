@@ -21,7 +21,8 @@ fi
 
 echo "Streaming monitor: $MONITOR to Hisense TV (60 FPS, Video-Only, Hardware VA-API, Priority -15)..."
 
-exec /home/wojtek/.local/bin/fluxcast \
+exec systemd-inhibit --what=idle:sleep:handle-lid-switch --who="FluxCast" --why="Active Miracast TV stream" \
+    /home/wojtek/.local/bin/fluxcast \
     --protocol wfd \
     --wfd-peer "42:CD:7A:36:FB:F7" \
     --monitor "$MONITOR" \

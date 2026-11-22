@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <time.h>
+#include <poll.h>
 #include <immintrin.h>
 
 #include <wayland-client.h>
@@ -34,8 +35,10 @@
 #define WIDTH 1920
 #define HEIGHT 1080
 
-static volatile bool g_running = true;
-static volatile bool g_streaming = false;
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_streaming = 0;
+static volatile sig_atomic_t g_exit_signal = 0;
+
 static int g_rtsp_client_fd = -1;
 static char g_tv_ip[64] = "192.168.179.1";
 static int g_tv_rtp_port = 1010;
@@ -45,16 +48,19 @@ static char g_session_id[32] = "3829104";
 static bool g_stream_only = false;
 
 static void handle_signal(int sig) {
-    (void)sig;
-    g_running = false;
-    g_streaming = false;
+    g_exit_signal = sig;
+    g_running = 0;
+    g_streaming = 0;
 }
 
 struct wayland_shm_buffer {
     struct wl_buffer *wl_buf;
     void *data;
     size_t size;
-    int fd;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t format;
 };
 
 struct wayland_context {
@@ -66,7 +72,9 @@ struct wayland_context {
     uint32_t shm_format;
     int width, height, stride;
 
-    struct wayland_shm_buffer buf;
+    struct wayland_shm_buffer bufs[2];
+    int cur_buf;
+    bool copy_done;
     bool frame_ready;
     bool frame_failed;
 };
@@ -74,7 +82,7 @@ struct wayland_context {
 static struct wayland_context g_wl;
 
 // Ultra-fast AVX2 SIMD XRGB8888 -> NV12 converter (Rec.601)
-// Processes 8 pixels per vector chunk with zero thread contention (4.0 ms per frame)
+// Processes 8 pixels per vector chunk with zero thread contention (~4.0 ms per frame)
 static inline void xrgb_to_nv12_ultra(const uint32_t *src, int w, int h, int stride_pixels,
                                       uint8_t *y_plane, int y_stride,
                                       uint8_t *uv_plane, int uv_stride) {
@@ -146,7 +154,7 @@ static inline void xrgb_to_nv12_ultra(const uint32_t *src, int w, int h, int str
     }
 }
 
-// Screencopy Callbacks
+// Screencopy Callbacks with dynamic dimension/stride recreation and leak-free memfd handling
 static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
         uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
     struct wayland_context *ctx = (struct wayland_context *)data;
@@ -155,19 +163,52 @@ static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *fra
     ctx->height = height;
     ctx->stride = stride;
 
-    struct wayland_shm_buffer *b = &ctx->buf;
-    if (!b->wl_buf) {
-        b->size = stride * height;
-        b->fd = memfd_create("wfd-shm", MFD_CLOEXEC);
-        ftruncate(b->fd, b->size);
-        b->data = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, b->fd, 0);
+    if (ctx->copy_done) {
+        return; // Guard against multiple format advertisements in protocol
+    }
 
-        struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, b->fd, b->size);
+    struct wayland_shm_buffer *b = &ctx->bufs[ctx->cur_buf];
+    // Recreate buffer if dimensions, stride, or format changed
+    if (b->wl_buf && (b->width != width || b->height != height || b->stride != stride || b->format != format)) {
+        wl_buffer_destroy(b->wl_buf);
+        munmap(b->data, b->size);
+        b->wl_buf = NULL;
+        b->data = NULL;
+    }
+
+    if (!b->wl_buf) {
+        b->width = width;
+        b->height = height;
+        b->stride = stride;
+        b->format = format;
+        b->size = (size_t)stride * height;
+
+        int fd = memfd_create("wfd-shm", MFD_CLOEXEC);
+        if (fd < 0) {
+            perror("[FluxCast-C Wayland] memfd_create failed");
+            return;
+        }
+        if (ftruncate(fd, b->size) < 0) {
+            perror("[FluxCast-C Wayland] ftruncate failed");
+            close(fd);
+            return;
+        }
+        b->data = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (b->data == MAP_FAILED) {
+            perror("[FluxCast-C Wayland] mmap failed");
+            close(fd);
+            b->data = NULL;
+            return;
+        }
+
+        struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, fd, b->size);
         b->wl_buf = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
         wl_shm_pool_destroy(pool);
+        close(fd); // Immediately close fd: compositor has duplicated it and mmap keeps region alive
     }
 
     zwlr_screencopy_frame_v1_copy(frame, b->wl_buf);
+    ctx->copy_done = true;
 }
 
 static void frame_handle_flags(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t flags) {}
@@ -220,7 +261,8 @@ static void *rtsp_server_thread(void *arg) {
         .sin_addr.s_addr = INADDR_ANY,
     };
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("RTSP bind failed");
+        perror("[FluxCast-C RTSP] Bind failed");
+        close(server_fd);
         return NULL;
     }
     listen(server_fd, 2);
@@ -228,6 +270,13 @@ static void *rtsp_server_thread(void *arg) {
     printf("[FluxCast-C RTSP] Server listening on 0.0.0.0:%d\n", WFD_RTSP_PORT);
 
     while (g_running) {
+        struct pollfd pfd = { .fd = server_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 500);
+        if (pr <= 0) {
+            if (!g_running) break;
+            continue;
+        }
+
         struct sockaddr_in client_addr;
         socklen_t len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &len);
@@ -391,7 +440,7 @@ static void *rtsp_server_thread(void *arg) {
                         "Session: %s\r\n\r\n", in_cseq, g_session_id);
                     send(client_fd, resp, strlen(resp), 0);
                     printf("[FluxCast-C RTSP] <- PLAY accepted! Triggering hardware stream!\n");
-                    g_streaming = true;
+                    g_streaming = 1;
                 }
 
                 int consumed = header_len + 4 + content_len;
@@ -401,7 +450,7 @@ static void *rtsp_server_thread(void *arg) {
             }
         }
 
-        g_streaming = false;
+        g_streaming = 0;
         close(client_fd);
         g_rtsp_client_fd = -1;
         printf("[FluxCast-C RTSP] TV disconnected.\n");
@@ -415,7 +464,9 @@ static void *rtsp_server_thread(void *arg) {
 static void *keepalive_thread(void *arg) {
     int keepalive_cseq = 100;
     while (g_running) {
-        sleep(5);
+        for (int i = 0; i < 50 && g_running; i++) {
+            usleep(100000); // 100ms ticks to exit promptly on signal
+        }
         if (g_streaming && g_rtsp_client_fd >= 0) {
             char req[512];
             snprintf(req, sizeof(req),
@@ -432,20 +483,6 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
-
-    // Real-Time System Hardening: Lock memory into RAM to eliminate page fault jitter
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
-        printf("[FluxCast-C System] Memory locked into RAM (Zero Page Fault Jitter)\n");
-    }
-
-    // Disable deep CPU C-States (C6/C7 wakeup latency elimination)
-    int pm_fd = open("/dev/cpu_dma_latency", O_WRONLY);
-    if (pm_fd >= 0) {
-        int32_t target_latency_us = 0;
-        if (write(pm_fd, &target_latency_us, sizeof(target_latency_us)) > 0) {
-            printf("[FluxCast-C System] PM QoS active: CPU C-states locked to C0/C1\n");
-        }
-    }
 
     printf("=========================================================\n");
     printf("  FluxCast-C: Pure C Zero-Abstraction Miracast Streamer \n");
@@ -467,6 +504,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    AVBufferRef *hw_device_ctx = NULL;
+    AVBufferRef *hw_frames_ref = NULL;
+    AVCodecContext *enc = NULL;
+    AVFormatContext *out_ctx = NULL;
+    AVFrame *sw_frame = NULL;
+    AVFrame *hw_frame = NULL;
+    AVPacket *pkt = NULL;
+    int timer_fd = -1;
+
     avformat_network_init();
 
     // 1. Wayland Screencopy Connection
@@ -485,10 +531,13 @@ int main(int argc, char **argv) {
     }
     printf("[FluxCast-C Wayland] Screencopy manager bound successfully.\n");
 
+    pthread_t rtsp_th, ka_th;
+    bool threads_started = false;
+
     if (!g_stream_only) {
-        pthread_t rtsp_th, ka_th;
         pthread_create(&rtsp_th, NULL, rtsp_server_thread, NULL);
         pthread_create(&ka_th, NULL, keepalive_thread, NULL);
+        threads_started = true;
 
         printf("[FluxCast-C] Waiting for TV connection and PLAY handshake...\n");
         while (!g_streaming && g_running) {
@@ -497,11 +546,14 @@ int main(int argc, char **argv) {
     } else {
         printf("[FluxCast-C] Stream-only mode: Target %s:%d (Source %s:%d)\n",
                g_tv_ip, g_tv_rtp_port, g_local_ip, g_local_rtp_port);
-        g_streaming = true;
+        g_streaming = 1;
+    }
+
+    if (!g_running) {
+        goto teardown;
     }
 
     // 3. Initialize VA-API Hardware Device Context
-    AVBufferRef *hw_device_ctx = NULL;
     int err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0);
     if (err < 0) {
         fprintf(stderr, "Error: Failed to open VA-API device /dev/dri/renderD128\n");
@@ -510,7 +562,7 @@ int main(int argc, char **argv) {
 
     // 4. Initialize Hardware H.264 Encoder
     const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
-    AVCodecContext *enc = avcodec_alloc_context3(codec);
+    enc = avcodec_alloc_context3(codec);
     enc->width = WIDTH;
     enc->height = HEIGHT;
     enc->time_base = (AVRational){1, 90000};
@@ -519,11 +571,11 @@ int main(int argc, char **argv) {
     enc->gop_size = 15;
     enc->max_b_frames = 0;
     enc->has_b_frames = 0;
-    enc->slices = 1; // Strict 1 slice: prevents 88% Intel VDENC driver bloat
+    enc->slices = 1; // Strict 1 slice: prevents Intel VDENC driver bloat
     enc->flags |= AV_CODEC_FLAG_LOW_DELAY; // Forces DPB max_dec_frame_buffering=1 (bypasses 33-50ms TV reordering delay)
     enc->flags2 |= AV_CODEC_FLAG2_FAST;
 
-    AVBufferRef *hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
+    hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
     AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
     frames_ctx->format = AV_PIX_FMT_VAAPI;
     frames_ctx->sw_format = AV_PIX_FMT_NV12;
@@ -540,10 +592,8 @@ int main(int argc, char **argv) {
     av_opt_set(enc->priv_data, "quality", "7", 0);
     av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(enc->priv_data, "qp", "28", 0);
-    av_opt_set(enc->priv_data, "sei", "recovery_point", 0); // Preserves sync recovery points while stripping HRD buffering delay
+    av_opt_set(enc->priv_data, "sei", "recovery_point", 0);
     av_opt_set(enc->priv_data, "async_depth", "1", 0);
-    // Note: Do NOT set "aud" here: Intel driver's aud corrupts slice byte-alignment!
-    // The MPEG-TS muxer automatically generates and inserts valid AUDs into each PES packet.
 
     err = avcodec_open2(enc, codec, NULL);
     if (err < 0) {
@@ -557,7 +607,6 @@ int main(int argc, char **argv) {
     snprintf(rtp_url, sizeof(rtp_url), "rtp://%s:%d", g_tv_ip, g_tv_rtp_port);
     printf("[FluxCast-C Network] Output target: %s (Source %s:%d)\n", rtp_url, g_local_ip, g_local_rtp_port);
 
-    AVFormatContext *out_ctx = NULL;
     avformat_alloc_output_context2(&out_ctx, NULL, "rtp_mpegts", rtp_url);
     AVStream *st = avformat_new_stream(out_ctx, NULL);
     st->id = 4113;
@@ -591,23 +640,41 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: Could not open RTP UDP output (%d)\n", err);
         return 1;
     }
+
+    // Apply Wi-Fi Multimedia (WMM) AC_VO (Voice/Ultra-low latency) QoS to RTP & RTCP sockets
+    for (int sfd = 3; sfd < 128; sfd++) {
+        struct sockaddr_in sin;
+        socklen_t slen = sizeof(sin);
+        if (getsockname(sfd, (struct sockaddr *)&sin, &slen) == 0) {
+            if (sin.sin_family == AF_INET &&
+                (ntohs(sin.sin_port) == g_local_rtp_port || ntohs(sin.sin_port) == g_local_rtp_port + 1)) {
+                int prio = 6; // Voice / Highest Priority Access Category (AC_VO)
+                setsockopt(sfd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
+                int tos = 0xb8; // DSCP Expedited Forwarding (EF)
+                setsockopt(sfd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+                printf("[FluxCast-C Network] Socket fd %d on port %d: Applied SO_PRIORITY=6 (WMM AC_VO), IP_TOS=0xb8 (DSCP EF)\n",
+                       sfd, ntohs(sin.sin_port));
+            }
+        }
+    }
+
     if (avformat_write_header(out_ctx, NULL) < 0) {
         fprintf(stderr, "Error: Failed to write RTP MPEG-TS header\n");
         return 1;
     }
 
     // 6. Allocate Frame Buffers
-    AVFrame *sw_frame = av_frame_alloc();
+    sw_frame = av_frame_alloc();
     sw_frame->format = AV_PIX_FMT_NV12;
     sw_frame->width = WIDTH;
     sw_frame->height = HEIGHT;
     av_frame_get_buffer(sw_frame, 32);
 
-    AVFrame *hw_frame = av_frame_alloc();
-    AVPacket *pkt = av_packet_alloc();
+    hw_frame = av_frame_alloc();
+    pkt = av_packet_alloc();
 
     // 7. 60Hz Precision Timer (16,666,666 ns)
-    int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
     struct itimerspec timer_spec = {
         .it_interval = { .tv_sec = 0, .tv_nsec = 16666666 },
         .it_value    = { .tv_sec = 0, .tv_nsec = 16666666 }
@@ -626,6 +693,7 @@ int main(int argc, char **argv) {
         uint64_t expirations = 0;
         if (read(timer_fd, &expirations, sizeof(expirations)) < 0) {
             if (errno == EINTR) continue;
+            fprintf(stderr, "[FluxCast-C Loop] timerfd read error: %s (errno %d)\n", strerror(errno), errno);
             break;
         }
 
@@ -639,33 +707,106 @@ int main(int argc, char **argv) {
 
         g_wl.frame_ready = false;
         g_wl.frame_failed = false;
+        g_wl.copy_done = false;
+
         struct zwlr_screencopy_frame_v1 *sc_frame =
             zwlr_screencopy_manager_v1_capture_output(g_wl.screencopy_mgr, 1, g_wl.output);
+        if (!sc_frame) {
+            fprintf(stderr, "[FluxCast-C Wayland] Failed to create screencopy frame\n");
+            continue;
+        }
         zwlr_screencopy_frame_v1_add_listener(sc_frame, &frame_listener, &g_wl);
-        wl_display_flush(g_wl.display);
+
+        if (wl_display_flush(g_wl.display) < 0 && errno != EAGAIN) {
+            if (errno != EINTR) {
+                fprintf(stderr, "[FluxCast-C Wayland] Display flush failed: %s\n", strerror(errno));
+                g_running = 0;
+                zwlr_screencopy_frame_v1_destroy(sc_frame);
+                break;
+            }
+        }
 
         while (!g_wl.frame_ready && !g_wl.frame_failed && g_running) {
-            wl_display_dispatch(g_wl.display);
+            if (wl_display_dispatch(g_wl.display) < 0) {
+                if (errno == EINTR) continue;
+                int wl_err = wl_display_get_error(g_wl.display);
+                fprintf(stderr, "[FluxCast-C Wayland] Fatal display connection error: %s (code %d, errno %d)\n",
+                        strerror(wl_err ? wl_err : errno), wl_err, errno);
+                g_running = 0;
+                break;
+            }
         }
         zwlr_screencopy_frame_v1_destroy(sc_frame);
 
-        if (g_wl.frame_ready) {
-            int stride_pixels = g_wl.stride / 4;
-            xrgb_to_nv12_ultra((const uint32_t *)g_wl.buf.data, WIDTH, HEIGHT, stride_pixels,
-                              sw_frame->data[0], sw_frame->linesize[0],
-                              sw_frame->data[1], sw_frame->linesize[1]);
+        if (g_wl.frame_failed || !g_wl.frame_ready) {
+            static uint32_t failed_consecutive = 0;
+            failed_consecutive++;
+            if (failed_consecutive == 1 || failed_consecutive % 300 == 0) {
+                fprintf(stderr, "[FluxCast-C Wayland] Screencopy capture failed (e.g. DPMS / display blanking, count=%u)\n",
+                        failed_consecutive);
+            }
+            // Drop cycle safely: do not send uninitialized/stale garbage to encoder
+            continue;
         }
 
-        av_hwframe_get_buffer(enc->hw_frames_ctx, hw_frame, 0);
-        av_hwframe_transfer_data(hw_frame, sw_frame, 0);
+        // Ultra-low latency AVX2 conversion from Wayland SHM buffer to NV12 sw_frame
+        int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~7) : WIDTH;
+        int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
+        int stride_pixels = g_wl.stride / 4;
+        xrgb_to_nv12_ultra((const uint32_t *)g_wl.bufs[g_wl.cur_buf].data, conv_w, conv_h, stride_pixels,
+                          sw_frame->data[0], sw_frame->linesize[0],
+                          sw_frame->data[1], sw_frame->linesize[1]);
+
+        // Ping-pong SHM buffer index for next capture
+        g_wl.cur_buf ^= 1;
+
+        // Hardware encode
+        err = av_hwframe_get_buffer(enc->hw_frames_ctx, hw_frame, 0);
+        if (err < 0) {
+            static int hw_buf_err_cnt = 0;
+            if (++hw_buf_err_cnt % 60 == 1) {
+                char errbuf[128];
+                av_strerror(err, errbuf, sizeof(errbuf));
+                fprintf(stderr, "[FluxCast-C Encoder] Hardware surface pool exhausted: %s (%d)\n", errbuf, err);
+            }
+            continue;
+        }
+
+        err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
+        if (err < 0) {
+            char errbuf[128];
+            av_strerror(err, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[FluxCast-C Encoder] Hardware DMA transfer failed: %s (%d)\n", errbuf, err);
+            av_frame_unref(hw_frame);
+            continue;
+        }
         hw_frame->pts = pts;
 
-        avcodec_send_frame(enc, hw_frame);
+        err = avcodec_send_frame(enc, hw_frame);
+        if (err < 0 && err != AVERROR(EAGAIN)) {
+            char errbuf[128];
+            av_strerror(err, errbuf, sizeof(errbuf));
+            fprintf(stderr, "[FluxCast-C Encoder] avcodec_send_frame failed: %s (%d)\n", errbuf, err);
+        }
+
         while (avcodec_receive_packet(enc, pkt) == 0) {
             pkt->stream_index = 0;
             pkt->pts = pts;
             pkt->dts = pts;
-            av_write_frame(out_ctx, pkt);
+            int w_ret = av_write_frame(out_ctx, pkt);
+            if (w_ret < 0) {
+                static int net_err_cnt = 0;
+                if (++net_err_cnt % 60 == 1) {
+                    char errbuf[128];
+                    av_strerror(w_ret, errbuf, sizeof(errbuf));
+                    fprintf(stderr, "[FluxCast-C Network] RTP transmission write error: %s (%d)\n", errbuf, w_ret);
+                }
+                if (w_ret == AVERROR(ECONNREFUSED) || w_ret == AVERROR(EPIPE) || w_ret == AVERROR(ENETUNREACH)) {
+                    fprintf(stderr, "[FluxCast-C Network] TV endpoint unreachable; terminating stream.\n");
+                    g_running = 0;
+                    g_streaming = 0;
+                }
+            }
             av_packet_unref(pkt);
         }
         av_frame_unref(hw_frame);
@@ -677,18 +818,90 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("[FluxCast-C] Teardown...\n");
-    close(timer_fd);
-    av_write_trailer(out_ctx);
-    avio_closep(&out_ctx->pb);
-    avformat_free_context(out_ctx);
+teardown:
+    printf("[FluxCast-C] Teardown");
+    if (g_exit_signal) {
+        printf(" (signal %d: %s)", (int)g_exit_signal, strsignal(g_exit_signal));
+    }
+    printf("...\n");
+
+    if (threads_started) {
+        pthread_join(rtsp_th, NULL);
+        pthread_join(ka_th, NULL);
+    }
+
+    // Drain encoder
+    if (enc && out_ctx) {
+        avcodec_send_frame(enc, NULL);
+        while (avcodec_receive_packet(enc, pkt) == 0) {
+            pkt->stream_index = 0;
+            av_write_frame(out_ctx, pkt);
+            av_packet_unref(pkt);
+        }
+    }
+
+    if (timer_fd >= 0) {
+        close(timer_fd);
+        timer_fd = -1;
+    }
+
+    if (out_ctx) {
+        av_write_trailer(out_ctx);
+        if (out_ctx->pb) {
+            avio_closep(&out_ctx->pb);
+        }
+        avformat_free_context(out_ctx);
+        out_ctx = NULL;
+    }
+
     av_frame_free(&sw_frame);
     av_frame_free(&hw_frame);
     av_packet_free(&pkt);
-    avcodec_free_context(&enc);
-    av_buffer_unref(&hw_frames_ref);
-    av_buffer_unref(&hw_device_ctx);
-    wl_display_disconnect(g_wl.display);
+
+    if (enc) {
+        avcodec_free_context(&enc);
+    }
+    if (hw_frames_ref) {
+        av_buffer_unref(&hw_frames_ref);
+    }
+    if (hw_device_ctx) {
+        av_buffer_unref(&hw_device_ctx);
+    }
+
+    // Clean up Wayland SHM buffers
+    for (int i = 0; i < 2; i++) {
+        if (g_wl.bufs[i].wl_buf) {
+            wl_buffer_destroy(g_wl.bufs[i].wl_buf);
+            g_wl.bufs[i].wl_buf = NULL;
+        }
+        if (g_wl.bufs[i].data) {
+            munmap(g_wl.bufs[i].data, g_wl.bufs[i].size);
+            g_wl.bufs[i].data = NULL;
+        }
+    }
+
+    // Clean up Wayland protocol objects
+    if (g_wl.screencopy_mgr) {
+        zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
+        g_wl.screencopy_mgr = NULL;
+    }
+    if (g_wl.output) {
+        wl_output_destroy(g_wl.output);
+        g_wl.output = NULL;
+    }
+    if (g_wl.shm) {
+        wl_shm_destroy(g_wl.shm);
+        g_wl.shm = NULL;
+    }
+    if (g_wl.registry) {
+        wl_registry_destroy(g_wl.registry);
+        g_wl.registry = NULL;
+    }
+    if (g_wl.display) {
+        wl_display_flush(g_wl.display);
+        wl_display_disconnect(g_wl.display);
+        g_wl.display = NULL;
+    }
 
     return 0;
 }
