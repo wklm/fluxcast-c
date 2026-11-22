@@ -23,6 +23,7 @@
 
 #include <wayland-client.h>
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "realtime_sys.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -688,14 +689,24 @@ int main(int argc, char **argv) {
 
     printf("[FluxCast-C Loop] Streaming live at 60 FPS directly into TV hardware!\n");
 
+    // Initialize kernel real-time subsystem (locks memory, pre-faults stack, pins to core 2)
+    realtime_sys_init(2);
+    pipeline_telemetry_t g_telem;
+    telemetry_init(&g_telem);
+
     // 8. Stream Loop
     while (g_running && g_streaming) {
+        struct timespec t_stage_start, t_stage_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+
         uint64_t expirations = 0;
         if (read(timer_fd, &expirations, sizeof(expirations)) < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "[FluxCast-C Loop] timerfd read error: %s (errno %d)\n", strerror(errno), errno);
             break;
         }
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_pacing_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t pts_us = (now.tv_sec - t_stream_start.tv_sec) * 1000000LL + (now.tv_nsec - t_stream_start.tv_nsec) / 1000;
@@ -709,6 +720,7 @@ int main(int argc, char **argv) {
         g_wl.frame_failed = false;
         g_wl.copy_done = false;
 
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         struct zwlr_screencopy_frame_v1 *sc_frame =
             zwlr_screencopy_manager_v1_capture_output(g_wl.screencopy_mgr, 1, g_wl.output);
         if (!sc_frame) {
@@ -738,6 +750,9 @@ int main(int argc, char **argv) {
         }
         zwlr_screencopy_frame_v1_destroy(sc_frame);
 
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+
         if (g_wl.frame_failed || !g_wl.frame_ready) {
             static uint32_t failed_consecutive = 0;
             failed_consecutive++;
@@ -750,6 +765,7 @@ int main(int argc, char **argv) {
         }
 
         // Ultra-low latency AVX2 conversion from Wayland SHM buffer to NV12 sw_frame
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~7) : WIDTH;
         int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
         int stride_pixels = g_wl.stride / 4;
@@ -759,8 +775,11 @@ int main(int argc, char **argv) {
 
         // Ping-pong SHM buffer index for next capture
         g_wl.cur_buf ^= 1;
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
 
         // Hardware encode
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         err = av_hwframe_get_buffer(enc->hw_frames_ctx, hw_frame, 0);
         if (err < 0) {
             static int hw_buf_err_cnt = 0;
@@ -780,6 +799,10 @@ int main(int argc, char **argv) {
             av_frame_unref(hw_frame);
             continue;
         }
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_upload_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         hw_frame->pts = pts;
 
         err = avcodec_send_frame(enc, hw_frame);
@@ -810,16 +833,23 @@ int main(int argc, char **argv) {
             av_packet_unref(pkt);
         }
         av_frame_unref(hw_frame);
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_encode_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us;
+
+        telemetry_record_frame(&g_telem, t_capture_us, t_convert_us, t_upload_us, t_encode_us, t_pacing_us, t_total_us);
 
         frame_count++;
         if (frame_count % 300 == 0) {
             printf("[FluxCast-C Stream] Transmitted %lu frames (%.1fs uptime, PTS=%ld)\n",
                    (unsigned long)frame_count, frame_count / 60.0, (long)pts);
+            telemetry_print_summary(&g_telem, "[FluxCast-C Telemetry]");
         }
     }
 
 teardown:
     printf("[FluxCast-C] Teardown");
+    realtime_sys_teardown();
     if (g_exit_signal) {
         printf(" (signal %d: %s)", (int)g_exit_signal, strsignal(g_exit_signal));
     }
