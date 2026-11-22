@@ -36,12 +36,6 @@ int net_pacer_init(net_pacer_t *pacer, const net_pacer_cfg_t *cfg) {
         return err;
     }
 
-    // 2. Allow port reuse for rapid restarts
-    int opt = 1;
-    if (setsockopt(pacer->sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        fprintf(stderr, "[FluxCast-C NetPacer] Warning: SO_REUSEADDR failed: %s\n", strerror(errno));
-    }
-
     // 3. Set IP_TOS = 0xC0: DSCP CS6 (Class Selector 6 / Network Control / Voice)
     // NOTE: In the Linux kernel (ip_sockglue.c), setsockopt(IP_TOS) automatically resets
     // sk->sk_priority = rt_tos2priority(tos). Therefore, IP_TOS MUST be configured BEFORE
@@ -244,9 +238,9 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
             }
         }
 
-        // Sample socket TX queue depth immediately prior to dispatch
+        bool collect_telemetry = telemetry_out && (size_t)i < max_telemetry;
         int q_bytes = 0;
-        if (ioctl(pacer->sockfd, SIOCOUTQ, &q_bytes) == 0) {
+        if (collect_telemetry && ioctl(pacer->sockfd, SIOCOUTQ, &q_bytes) == 0) {
             if (q_bytes > pacer->stats.peak_tx_queue_bytes) {
                 pacer->stats.peak_tx_queue_bytes = q_bytes;
             }
@@ -261,10 +255,6 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
                                 (struct sockaddr *)&pacer->dest_addr, sizeof(pacer->dest_addr));
         }
 
-        struct timespec ts_dep;
-        clock_gettime(CLOCK_MONOTONIC, &ts_dep);
-        uint64_t departure_ns = (uint64_t)ts_dep.tv_sec * 1000000000ULL + ts_dep.tv_nsec;
-
         if (bytes_sent >= 0) {
             sent_count++;
             pacer->stats.packets_sent++;
@@ -273,7 +263,10 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
             pacer->stats.send_errors++;
         }
 
-        if (telemetry_out && (size_t)i < max_telemetry) {
+        if (collect_telemetry) {
+            struct timespec ts_dep;
+            clock_gettime(CLOCK_MONOTONIC, &ts_dep);
+            uint64_t departure_ns = (uint64_t)ts_dep.tv_sec * 1000000000ULL + ts_dep.tv_nsec;
             telemetry_out[i].target_ns      = target_ns;
             telemetry_out[i].departure_ns   = departure_ns;
             telemetry_out[i].jitter_ns      = (int64_t)departure_ns - (int64_t)target_ns;

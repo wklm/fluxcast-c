@@ -52,6 +52,11 @@ static inline void store_32(uint8_t *dst, __m256i value, bool non_temporal) {
 void color_convert_xrgb_to_nv12_bt709(const uint32_t *src, int w, int h, int stride_pixels,
                                       uint8_t *y_plane, int y_stride,
                                       uint8_t *uv_plane, int uv_stride) {
+    if (!src || !y_plane || !uv_plane || w <= 0 || h <= 0 || (w & 1) || (h & 1) ||
+        stride_pixels < w || y_stride < w || uv_stride < w) {
+        return;
+    }
+
     const __m256i restore_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     const __m256i compact_even_bytes = _mm256_setr_epi8(
         0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1,

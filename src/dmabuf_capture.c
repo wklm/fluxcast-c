@@ -77,6 +77,12 @@ static void sc_damage(void *data, struct zwlr_screencopy_frame_v1 *f,
 static void sc_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *f,
                             uint32_t format, uint32_t width, uint32_t height) {
     DmaBufCapture *cap = (DmaBufCapture *)data;
+    if ((cap->format && cap->format != format) ||
+        (cap->width && cap->width != width) || (cap->height && cap->height != height)) {
+        fprintf(stderr, "[dmabuf_capture] Output format or dimensions changed; restart capture\n");
+        cap->frame_failed = 1;
+        return;
+    }
     cap->format = format;
     cap->width = width;
     cap->height = height;
@@ -115,6 +121,10 @@ static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
 
     // Create Wayland buffer using zwp_linux_dmabuf_v1
     struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(cap->dmabuf_mgr);
+    if (!params) {
+        fprintf(stderr, "[dmabuf_capture] Error: Failed to create buffer parameters\n");
+        return -ENOMEM;
+    }
     zwp_linux_buffer_params_v1_add(params, b->prime_fd, 0, 0, b->stride,
                                   (uint32_t)(b->modifier >> 32), (uint32_t)(b->modifier & 0xffffffff));
     b->wl_buf = zwp_linux_buffer_params_v1_create_immed(params, cap->width, cap->height, cap->format, 0);
@@ -175,6 +185,7 @@ static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
 }
 
 int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cfg) {
+    if (out_cap) *out_cap = NULL;
     if (!out_cap || !cfg || !cfg->display || !cfg->screencopy_mgr || !cfg->dmabuf_mgr || !cfg->output) {
         return -EINVAL;
     }
@@ -207,8 +218,8 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
     wl_display_roundtrip(cap->display);
     zwlr_screencopy_frame_v1_destroy(probe_frame);
 
-    if (cap->format == 0 || cap->width == 0 || cap->height == 0) {
-        fprintf(stderr, "[dmabuf_capture] Compositor did not advertise linux-dmabuf format\n");
+    if (cap->frame_failed || cap->format != DRM_FORMAT_XRGB8888 || cap->width == 0 || cap->height == 0) {
+        fprintf(stderr, "[dmabuf_capture] Compositor did not advertise a compatible linux-dmabuf format\n");
         dmabuf_capture_destroy(cap);
         return -ENOTSUP;
     }
@@ -238,6 +249,10 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
     // If VADisplay wasn't passed in, initialize one
     if (!cap->va_dpy) {
         cap->va_dpy = vaGetDisplayDRM(cap->drm_fd);
+        if (!cap->va_dpy) {
+            dmabuf_capture_destroy(cap);
+            return -ENODEV;
+        }
         int maj, min;
         if (vaInitialize(cap->va_dpy, &maj, &min) != VA_STATUS_SUCCESS) {
             fprintf(stderr, "[dmabuf_capture] vaInitialize failed\n");

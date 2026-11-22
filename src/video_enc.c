@@ -156,7 +156,7 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
     /* Fastest hardware quality pass: quality=7 */
     av_opt_set(c->priv_data, "quality", qual_str, 0);
 
-    /* Enforce zero-delay Constant Quantization Parameter: rc_mode=CQP, qp=22 */
+    /* Use constant quantization without rate-control lookahead. */
     av_opt_set(c->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(c->priv_data, "qp", qp_str, 0);
 

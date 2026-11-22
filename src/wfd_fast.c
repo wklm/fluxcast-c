@@ -43,7 +43,7 @@ static int pacer_avio_write_cb(void *opaque, const uint8_t *buf, int size) {
     if (size <= 0) return 0;
     // Miracast RTP packets are standard 1328 bytes (12B RTP header + 7 * 188B TS packets) with PT=33
     if (size == NET_PACER_RTP_PACKET_SIZE || (size > 12 && (buf[1] & 0x7F) == 33)) {
-        net_pacer_queue_packet(pacer, buf, size);
+        return net_pacer_queue_packet(pacer, buf, size) < 0 ? AVERROR(EIO) : size;
     }
     return size;
 }
@@ -131,6 +131,13 @@ static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
 static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
         uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
     struct wayland_context *ctx = (struct wayland_context *)data;
+    if (format != WL_SHM_FORMAT_XRGB8888 || width == 0 || height == 0 ||
+        width > INT32_MAX || height > INT32_MAX || stride > INT32_MAX ||
+        (uint64_t)width * 4 > stride) {
+        fprintf(stderr, "[FluxCast-C Wayland] Unsupported SHM buffer layout\n");
+        ctx->frame_failed = true;
+        return;
+    }
     ctx->shm_format = format;
     ctx->width = width;
     ctx->height = height;
@@ -176,11 +183,26 @@ static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *fra
         }
 
         struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, fd, b->size);
+        if (!pool) {
+            close(fd);
+            munmap(b->data, b->size);
+            b->data = NULL;
+            return;
+        }
         b->wl_buf = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
         wl_shm_pool_destroy(pool);
-        close(fd); // Immediately close fd: compositor has duplicated it and mmap keeps region alive
+        close(fd);
+        if (!b->wl_buf) {
+            munmap(b->data, b->size);
+            b->data = NULL;
+            return;
+        }
     }
 
+    if (!b->wl_buf || !b->data) {
+        ctx->frame_failed = true;
+        return;
+    }
     zwlr_screencopy_frame_v1_copy_with_damage(frame, b->wl_buf);
     ctx->copy_done = true;
 }
@@ -240,7 +262,12 @@ static const struct wl_registry_listener registry_listener = {
 
 // RTSP Server Thread (used for standalone mode)
 static void *rtsp_server_thread(void *arg) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server_fd < 0) {
+        perror("[FluxCast-C RTSP] Socket failed");
+        g_running = 0;
+        return NULL;
+    }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -252,9 +279,15 @@ static void *rtsp_server_thread(void *arg) {
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("[FluxCast-C RTSP] Bind failed");
         close(server_fd);
+        g_running = 0;
         return NULL;
     }
-    listen(server_fd, 2);
+    if (listen(server_fd, 2) < 0) {
+        perror("[FluxCast-C RTSP] Listen failed");
+        close(server_fd);
+        g_running = 0;
+        return NULL;
+    }
 
     printf("[FluxCast-C RTSP] Server listening on 0.0.0.0:%d\n", WFD_RTSP_PORT);
 
@@ -315,7 +348,16 @@ static void *rtsp_server_thread(void *arg) {
                 int content_len = 0;
                 char *cl_pos = strstr(headers, "Content-Length:");
                 if (!cl_pos) cl_pos = strstr(headers, "content-length:");
-                if (cl_pos) content_len = atoi(cl_pos + 15);
+                if (cl_pos) {
+                    char *end = NULL;
+                    errno = 0;
+                    long parsed = strtol(cl_pos + 15, &end, 10);
+                    if (errno == ERANGE || end == cl_pos + 15 || parsed < 0 || parsed > 4095) {
+                        fprintf(stderr, "[FluxCast-C RTSP] Invalid or oversized Content-Length\n");
+                        goto client_done;
+                    }
+                    content_len = (int)parsed;
+                }
 
                 int body_len = buf_len - (header_len + 4);
                 if (body_len < content_len) {
@@ -341,7 +383,8 @@ static void *rtsp_server_thread(void *arg) {
                         char *p = strstr(full_body, "wfd_client_rtp_ports:");
                         if (p) {
                             int rtp_p = 0;
-                            if (sscanf(p, "wfd_client_rtp_ports: RTP/AVP/UDP;unicast %d", &rtp_p) == 1) {
+                            if (sscanf(p, "wfd_client_rtp_ports: RTP/AVP/UDP;unicast %d", &rtp_p) == 1 &&
+                                rtp_p > 0 && rtp_p <= 65535) {
                                 g_tv_rtp_port = rtp_p;
                             }
                         }
@@ -439,6 +482,7 @@ static void *rtsp_server_thread(void *arg) {
             }
         }
 
+client_done:
         g_streaming = 0;
         close(client_fd);
         g_rtsp_client_fd = -1;
@@ -496,13 +540,19 @@ int main(int argc, char **argv) {
     }
 
     VideoEncoder venc;
+    int exit_code = 0;
     bool venc_initialized = false;
+    bool pacer_initialized = false;
+    bool muxer_header_written = false;
     AVCodecContext *enc = NULL;
     AVFormatContext *out_ctx = NULL;
     AVFrame *sw_frame = NULL;
     AVPacket *pkt = NULL;
     DmaBufCapture *dmabuf_cap = NULL;
     int timer_fd = -1;
+    pthread_t rtsp_th, ka_th;
+    bool rtsp_started = false;
+    bool ka_started = false;
 
     avformat_network_init();
 
@@ -510,25 +560,32 @@ int main(int argc, char **argv) {
     g_wl.display = wl_display_connect(NULL);
     if (!g_wl.display) {
         fprintf(stderr, "Error: Could not connect to Wayland compositor\n");
-        return 1;
+        goto error;
     }
     g_wl.registry = wl_display_get_registry(g_wl.display);
+    if (!g_wl.registry) goto error;
     wl_registry_add_listener(g_wl.registry, &registry_listener, &g_wl);
     wl_display_roundtrip(g_wl.display);
 
     if (!g_wl.shm || !g_wl.screencopy_mgr || !g_wl.output) {
         fprintf(stderr, "Error: Compositor missing required screencopy protocols\n");
-        return 1;
+        goto error;
     }
     printf("[FluxCast-C Wayland] Screencopy manager bound successfully.\n");
 
-    pthread_t rtsp_th, ka_th;
-    bool threads_started = false;
-
     if (!g_stream_only) {
-        pthread_create(&rtsp_th, NULL, rtsp_server_thread, NULL);
-        pthread_create(&ka_th, NULL, keepalive_thread, NULL);
-        threads_started = true;
+        int thread_err = pthread_create(&rtsp_th, NULL, rtsp_server_thread, NULL);
+        if (thread_err != 0) {
+            fprintf(stderr, "Error: Failed to start RTSP thread: %s\n", strerror(thread_err));
+            goto error;
+        }
+        rtsp_started = true;
+        thread_err = pthread_create(&ka_th, NULL, keepalive_thread, NULL);
+        if (thread_err != 0) {
+            fprintf(stderr, "Error: Failed to start keepalive thread: %s\n", strerror(thread_err));
+            goto error;
+        }
+        ka_started = true;
 
         printf("[FluxCast-C] Waiting for TV connection and PLAY handshake...\n");
         while (!g_streaming && g_running) {
@@ -562,7 +619,7 @@ int main(int argc, char **argv) {
     int err = video_enc_init(&venc, &enc_cfg);
     if (err < 0) {
         fprintf(stderr, "Error: Failed to initialize video encoder (%d)\n", err);
-        return 1;
+        goto error;
     }
     venc_initialized = true;
     enc = venc.codec_ctx;
@@ -603,8 +660,9 @@ int main(int argc, char **argv) {
     };
     if (net_pacer_init(&g_pacer, &pacer_cfg) < 0) {
         fprintf(stderr, "Error: Failed to initialize net_pacer\n");
-        return 1;
+        goto error;
     }
+    pacer_initialized = true;
 
     // 5. Initialize Zero-Delay RTP MPEG-TS Output with Custom AVIO
     char rtp_url[256];
@@ -614,16 +672,23 @@ int main(int argc, char **argv) {
     avformat_alloc_output_context2(&out_ctx, NULL, "rtp_mpegts", rtp_url);
     if (!out_ctx) {
         fprintf(stderr, "Error: Failed to allocate output context\n");
-        return 1;
+        goto error;
     }
 
     size_t avio_buf_size = 2048;
     unsigned char *avio_buf = av_malloc(avio_buf_size);
+    if (!avio_buf) goto error;
     AVIOContext *avio = avio_alloc_context(avio_buf, avio_buf_size, 1, &g_pacer, NULL, pacer_avio_write_cb, NULL);
+    if (!avio) {
+        av_free(avio_buf);
+        goto error;
+    }
     avio->max_packet_size = 1328;
     out_ctx->pb = avio;
+    out_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
 
     AVStream *st = avformat_new_stream(out_ctx, NULL);
+    if (!st) goto error;
     st->id = 4113;
     st->time_base = (AVRational){1, 90000};
     avcodec_parameters_from_context(st->codecpar, enc);
@@ -646,20 +711,23 @@ int main(int argc, char **argv) {
 
     if (avformat_write_header(out_ctx, NULL) < 0) {
         fprintf(stderr, "Error: Failed to write RTP MPEG-TS header\n");
-        return 1;
+        goto error;
     }
+    muxer_header_written = true;
 
     // 6. Allocate Frame Buffers
     sw_frame = video_enc_alloc_sw_frame(&venc);
     pkt = av_packet_alloc();
+    if (!sw_frame || !pkt) goto error;
 
     // 7. 60Hz Precision Timer (16,666,666 ns)
-    timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (timer_fd < 0) goto error;
     struct itimerspec timer_spec = {
         .it_interval = { .tv_sec = 0, .tv_nsec = 16666666 },
         .it_value    = { .tv_sec = 0, .tv_nsec = 16666666 }
     };
-    timerfd_settime(timer_fd, 0, &timer_spec, NULL);
+    if (timerfd_settime(timer_fd, 0, &timer_spec, NULL) < 0) goto error;
 
     struct timespec t_stream_start;
     clock_gettime(CLOCK_MONOTONIC, &t_stream_start);
@@ -902,6 +970,12 @@ int main(int argc, char **argv) {
             telemetry_print_summary(&g_telem, "[FluxCast-C Telemetry]");
         }
     }
+    goto teardown;
+
+error:
+    exit_code = 1;
+    g_running = 0;
+    g_streaming = 0;
 
 teardown:
     printf("[FluxCast-C] Teardown");
@@ -911,10 +985,9 @@ teardown:
     }
     printf("...\n");
 
-    if (threads_started) {
-        pthread_join(rtsp_th, NULL);
-        pthread_join(ka_th, NULL);
-    }
+    if (g_rtsp_client_fd >= 0) shutdown(g_rtsp_client_fd, SHUT_RDWR);
+    if (rtsp_started) pthread_join(rtsp_th, NULL);
+    if (ka_started) pthread_join(ka_th, NULL);
 
     if (timer_fd >= 0) {
         close(timer_fd);
@@ -922,7 +995,7 @@ teardown:
     }
 
     if (out_ctx) {
-        av_write_trailer(out_ctx);
+        if (muxer_header_written) av_write_trailer(out_ctx);
         if (out_ctx->pb) {
             av_freep(&out_ctx->pb->buffer);
             avio_context_free(&out_ctx->pb);
@@ -931,7 +1004,7 @@ teardown:
         out_ctx = NULL;
     }
 
-    net_pacer_close(&g_pacer);
+    if (pacer_initialized) net_pacer_close(&g_pacer);
 
     if (pkt) {
         av_packet_free(&pkt);
@@ -986,5 +1059,5 @@ teardown:
         g_wl.display = NULL;
     }
 
-    return 0;
+    return exit_code;
 }
