@@ -279,6 +279,23 @@ int main(int argc, char **argv) {
     VAContextID vpp_ctx;
     vaCreateContext(va_dpy, vpp_cfg, width, height, 0, NULL, 0, &vpp_ctx);
     VARectangle rect = {0, 0, (uint16_t)width, (uint16_t)height};
+    VABufferID pipe_bufs[2] = { VA_INVALID_ID, VA_INVALID_ID };
+    for (int k = 0; k < 2; k++) {
+        VAProcPipelineParameterBuffer param = {
+            .surface = dmabuf_bufs[k].va_surf,
+            .surface_region = &rect,
+            .output_region = &rect,
+            .surface_color_standard = VAProcColorStandardSRGB,
+            .input_color_properties.colour_primaries = 1,
+            .input_color_properties.transfer_characteristics = 13,
+            .input_color_properties.matrix_coefficients = 0,
+            .input_color_properties.color_range = VA_SOURCE_RANGE_FULL,
+            .output_color_standard = VAProcColorStandardBT709,
+            .output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED
+        };
+        vaCreateBuffer(va_dpy, vpp_ctx, VAProcPipelineParameterBufferType,
+                       sizeof(param), 1, &param, &pipe_bufs[k]);
+    }
 
     double *z_cap = malloc(bench_frames * sizeof(double));
     double *z_conv = malloc(bench_frames * sizeof(double));
@@ -302,24 +319,10 @@ int main(int argc, char **argv) {
         // Hardware VPP color conversion
         VASurfaceID dst_surf = VA_INVALID_ID;
         video_enc_get_hw_surface(&enc, &dst_surf);
-        VAProcPipelineParameterBuffer param = {
-            .surface = dmabuf_bufs[cur_db].va_surf,
-            .surface_region = &rect,
-            .output_region = &rect,
-            .surface_color_standard = VAProcColorStandardSRGB,
-            .input_color_properties.colour_primaries = 1,
-            .input_color_properties.transfer_characteristics = 13,
-            .input_color_properties.matrix_coefficients = 0,
-            .input_color_properties.color_range = VA_SOURCE_RANGE_FULL,
-            .output_color_standard = VAProcColorStandardBT709,
-            .output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED
-        };
-        VABufferID pipe_buf;
-        vaCreateBuffer(va_dpy, vpp_ctx, VAProcPipelineParameterBufferType, sizeof(param), 1, &param, &pipe_buf);
+        VABufferID pipe_buf = pipe_bufs[cur_db];
         vaBeginPicture(va_dpy, vpp_ctx, dst_surf);
         vaRenderPicture(va_dpy, vpp_ctx, &pipe_buf, 1);
         vaEndPicture(va_dpy, vpp_ctx);
-        vaDestroyBuffer(va_dpy, pipe_buf);
         clock_gettime(CLOCK_MONOTONIC, &t2);
 
         // Direct VDENC ASIC encode
@@ -409,6 +412,9 @@ int main(int argc, char **argv) {
         wl_display_roundtrip(display);
     }
 
+    for (int k = 0; k < 2; k++) {
+        if (pipe_bufs[k] != VA_INVALID_ID) vaDestroyBuffer(va_dpy, pipe_bufs[k]);
+    }
     vaDestroyContext(va_dpy, vpp_ctx);
     vaDestroyConfig(va_dpy, vpp_cfg);
     for (int k = 0; k < 2; k++) {

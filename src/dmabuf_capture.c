@@ -28,6 +28,7 @@ struct dmabuf_buffer {
     uint64_t modifier;
     struct wl_buffer *wl_buf;
     VASurfaceID va_surface;
+    VABufferID pipe_buf;
 };
 
 struct DmaBufCapture {
@@ -98,6 +99,21 @@ static const struct zwlr_screencopy_frame_v1_listener sc_listener = {
     .linux_dmabuf = sc_linux_dmabuf,
     .buffer_done = sc_buffer_done,
 };
+
+static void init_vpp_param(DmaBufCapture *cap, VASurfaceID surface,
+                           VAProcPipelineParameterBuffer *param) {
+    memset(param, 0, sizeof(*param));
+    param->surface = surface;
+    param->surface_region = &cap->vpp_rect;
+    param->output_region = &cap->vpp_rect;
+    param->surface_color_standard = VAProcColorStandardSRGB;
+    param->input_color_properties.colour_primaries = 1;
+    param->input_color_properties.transfer_characteristics = 13;
+    param->input_color_properties.matrix_coefficients = 0;
+    param->input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
+    param->output_color_standard = VAProcColorStandardBT709;
+    param->output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
+}
 
 static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
     b->bo = gbm_bo_create(cap->gbm, cap->width, cap->height, GBM_FORMAT_XRGB8888,
@@ -205,6 +221,7 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
     for (int i = 0; i < NUM_DMABUF_BUFFERS; i++) {
         cap->bufs[i].prime_fd = -1;
         cap->bufs[i].va_surface = VA_INVALID_ID;
+        cap->bufs[i].pipe_buf = VA_INVALID_ID;
     }
 
     // Step 1: Probe compositor screencopy support for linux-dmabuf
@@ -287,6 +304,17 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
     }
 
     cap->vpp_rect = (VARectangle){0, 0, (uint16_t)cap->width, (uint16_t)cap->height};
+    for (int i = 0; i < NUM_DMABUF_BUFFERS; i++) {
+        VAProcPipelineParameterBuffer param;
+        init_vpp_param(cap, cap->bufs[i].va_surface, &param);
+        st = vaCreateBuffer(cap->va_dpy, cap->vpp_ctx, VAProcPipelineParameterBufferType,
+                            sizeof(param), 1, &param, &cap->bufs[i].pipe_buf);
+        if (st != VA_STATUS_SUCCESS) {
+            dmabuf_capture_destroy(cap);
+            return -EIO;
+        }
+    }
+
     *out_cap = cap;
     return 0;
 }
@@ -332,39 +360,19 @@ int dmabuf_capture_convert_vpp(DmaBufCapture *cap, VASurfaceID dst_surface) {
 
     struct dmabuf_buffer *buf = &cap->bufs[cap->cur_buf];
 
-    VAProcPipelineParameterBuffer vpp_param;
-    memset(&vpp_param, 0, sizeof(vpp_param));
-    vpp_param.surface = buf->va_surface;
-    vpp_param.surface_region = &cap->vpp_rect;
-    vpp_param.output_region = &cap->vpp_rect;
-    vpp_param.surface_color_standard = VAProcColorStandardSRGB;
-    vpp_param.input_color_properties.colour_primaries = 1;
-    vpp_param.input_color_properties.transfer_characteristics = 13;
-    vpp_param.input_color_properties.matrix_coefficients = 0;
-    vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
-    vpp_param.output_color_standard = VAProcColorStandardBT709;
-    vpp_param.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
+    VABufferID pipe_buf = buf->pipe_buf;
+    if (pipe_buf == VA_INVALID_ID) return -EINVAL;
 
-    VABufferID pipe_buf = VA_INVALID_ID;
-    VAStatus st = vaCreateBuffer(cap->va_dpy, cap->vpp_ctx, VAProcPipelineParameterBufferType,
-                                sizeof(vpp_param), 1, &vpp_param, &pipe_buf);
+    VAStatus st = vaBeginPicture(cap->va_dpy, cap->vpp_ctx, dst_surface);
     if (st != VA_STATUS_SUCCESS) return -EIO;
-
-    st = vaBeginPicture(cap->va_dpy, cap->vpp_ctx, dst_surface);
-    if (st != VA_STATUS_SUCCESS) {
-        vaDestroyBuffer(cap->va_dpy, pipe_buf);
-        return -EIO;
-    }
 
     st = vaRenderPicture(cap->va_dpy, cap->vpp_ctx, &pipe_buf, 1);
     if (st != VA_STATUS_SUCCESS) {
         vaEndPicture(cap->va_dpy, cap->vpp_ctx);
-        vaDestroyBuffer(cap->va_dpy, pipe_buf);
         return -EIO;
     }
 
     st = vaEndPicture(cap->va_dpy, cap->vpp_ctx);
-    vaDestroyBuffer(cap->va_dpy, pipe_buf);
 
     // Advance buffer index for double buffering
     cap->cur_buf ^= 1;
@@ -392,6 +400,12 @@ void dmabuf_capture_destroy(DmaBufCapture *cap) {
         wl_display_roundtrip(cap->display);
     }
 
+    for (int i = 0; i < NUM_DMABUF_BUFFERS; i++) {
+        if (cap->bufs[i].pipe_buf != VA_INVALID_ID) {
+            vaDestroyBuffer(cap->va_dpy, cap->bufs[i].pipe_buf);
+            cap->bufs[i].pipe_buf = VA_INVALID_ID;
+        }
+    }
     if (cap->vpp_ctx != VA_INVALID_ID) {
         vaDestroyContext(cap->va_dpy, cap->vpp_ctx);
         cap->vpp_ctx = VA_INVALID_ID;
