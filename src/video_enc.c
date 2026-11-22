@@ -188,6 +188,23 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
         return AVERROR(ENOMEM);
     }
 
+    VAProfile va_profile;
+    switch (enc->config.profile) {
+        case AV_PROFILE_H264_HIGH:                va_profile = VAProfileH264High; break;
+        case AV_PROFILE_H264_MAIN:                va_profile = VAProfileH264Main; break;
+        case AV_PROFILE_H264_CONSTRAINED_BASELINE: va_profile = VAProfileH264ConstrainedBaseline; break;
+        default:                                  va_profile = VAProfileNone; break;
+    }
+    VADisplay va_dpy = video_enc_get_va_display(enc);
+    if (va_dpy && va_profile != VAProfileNone) {
+        VAConfigAttrib attr = { .type = VAConfigAttribEncROI };
+        VAStatus status = vaGetConfigAttributes(va_dpy, va_profile, VAEntrypointEncSliceLP, &attr, 1);
+        if (status == VA_STATUS_SUCCESS && attr.value != VA_ATTRIB_NOT_SUPPORTED) {
+            VAConfigAttribValEncROI roi = { .value = attr.value };
+            enc->roi_max_regions = roi.bits.num_roi_regions;
+        }
+    }
+
     return 0;
 }
 
@@ -214,7 +231,38 @@ AVFrame *video_enc_alloc_sw_frame(const VideoEncoder *enc) {
     return frame;
 }
 
-int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts) {
+static int attach_rois(VideoEncoder *enc, const VideoEncRoi *rois, size_t roi_count) {
+    if (roi_count == 0 || enc->roi_max_regions == 0) return 0;
+    if (!rois) return AVERROR(EINVAL);
+    if ((int)roi_count > enc->roi_max_regions) roi_count = (size_t)enc->roi_max_regions;
+
+    AVFrameSideData *sd = av_frame_new_side_data(enc->hw_frame, AV_FRAME_DATA_REGIONS_OF_INTEREST,
+                                                 roi_count * sizeof(AVRegionOfInterest));
+    if (!sd) return AVERROR(ENOMEM);
+
+    for (size_t i = 0; i < roi_count; i++) {
+        int64_t right = (int64_t)rois[i].x + rois[i].width;
+        int64_t bottom = (int64_t)rois[i].y + rois[i].height;
+        if (rois[i].x < 0 || rois[i].y < 0 || rois[i].width <= 0 || rois[i].height <= 0 ||
+            right > enc->config.width || bottom > enc->config.height ||
+            rois[i].qp_delta <= 0 || rois[i].qp_delta > 51) {
+            return AVERROR(EINVAL);
+        }
+        AVRegionOfInterest *roi = (AVRegionOfInterest *)sd->data + i;
+        *roi = (AVRegionOfInterest) {
+            .self_size = sizeof(*roi),
+            .top = rois[i].y,
+            .bottom = (int)bottom,
+            .left = rois[i].x,
+            .right = (int)right,
+            .qoffset = { -rois[i].qp_delta, 51 },
+        };
+    }
+    return 0;
+}
+
+int video_enc_send_frame_with_rois(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts,
+                                   const VideoEncRoi *rois, size_t roi_count) {
     if (!enc || !enc->codec_ctx) return AVERROR(EINVAL);
 
     /* Flushing/draining encoder */
@@ -246,6 +294,11 @@ int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts) {
     enc->last_dma_time_us = (t1 - t0);
 
     enc->hw_frame->pts = pts;
+    err = attach_rois(enc, rois, roi_count);
+    if (err < 0) {
+        av_frame_unref(enc->hw_frame);
+        return err;
+    }
 
     /* Submit surface to Intel VDENC ASIC */
     int64_t t_send0 = get_time_us();
@@ -256,6 +309,10 @@ int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts) {
     av_frame_unref(enc->hw_frame);
 
     return err;
+}
+
+int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts) {
+    return video_enc_send_frame_with_rois(enc, sw_frame, pts, NULL, 0);
 }
 
 VADisplay video_enc_get_va_display(const VideoEncoder *enc) {
@@ -279,20 +336,31 @@ int video_enc_get_hw_surface(VideoEncoder *enc, VASurfaceID *out_surface) {
     return 0;
 }
 
-int video_enc_send_hw_surface(VideoEncoder *enc, int64_t pts) {
+int video_enc_send_hw_surface_with_rois(VideoEncoder *enc, int64_t pts,
+                                        const VideoEncRoi *rois, size_t roi_count) {
     if (!enc || !enc->codec_ctx || !enc->hw_frame) {
         return AVERROR(EINVAL);
     }
     enc->hw_frame->pts = pts;
     enc->last_dma_time_us = 0; // Zero-copy: 0 us host-to-device upload
 
+    int err = attach_rois(enc, rois, roi_count);
+    if (err < 0) {
+        av_frame_unref(enc->hw_frame);
+        return err;
+    }
+
     int64_t t_send0 = get_time_us();
-    int err = avcodec_send_frame(enc->codec_ctx, enc->hw_frame);
+    err = avcodec_send_frame(enc->codec_ctx, enc->hw_frame);
     int64_t t_send1 = get_time_us();
     enc->last_send_time_us = (t_send1 - t_send0);
 
     av_frame_unref(enc->hw_frame);
     return err;
+}
+
+int video_enc_send_hw_surface(VideoEncoder *enc, int64_t pts) {
+    return video_enc_send_hw_surface_with_rois(enc, pts, NULL, 0);
 }
 
 int video_enc_receive_packet(VideoEncoder *enc, AVPacket *pkt) {

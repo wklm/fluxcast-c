@@ -28,6 +28,7 @@
 #include "video_enc.h"
 #include "net_pacer.h"
 #include "color_convert.h"
+#include "damage_tracker.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -71,6 +72,17 @@ static void handle_signal(int sig) {
     g_streaming = 0;
 }
 
+static int64_t stream_next_pts(const struct timespec *stream_start, int64_t *last_pts) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t pts_us = (now.tv_sec - stream_start->tv_sec) * 1000000LL +
+                     (now.tv_nsec - stream_start->tv_nsec) / 1000;
+    int64_t pts = (pts_us * 90) / 1000;
+    if (pts <= *last_pts) pts = *last_pts + 1;
+    *last_pts = pts;
+    return pts;
+}
+
 struct wayland_shm_buffer {
     struct wl_buffer *wl_buf;
     void *data;
@@ -96,6 +108,7 @@ struct wayland_context {
     bool copy_done;
     bool frame_ready;
     bool frame_failed;
+    DamageTracker damage;
 };
 
 static struct wayland_context g_wl;
@@ -122,6 +135,7 @@ static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *fra
     ctx->width = width;
     ctx->height = height;
     ctx->stride = stride;
+    damage_tracker_set_dimensions(&ctx->damage, width, height);
 
     if (ctx->copy_done) {
         return; // Guard against multiple format advertisements in protocol
@@ -167,7 +181,7 @@ static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *fra
         close(fd); // Immediately close fd: compositor has duplicated it and mmap keeps region alive
     }
 
-    zwlr_screencopy_frame_v1_copy(frame, b->wl_buf);
+    zwlr_screencopy_frame_v1_copy_with_damage(frame, b->wl_buf);
     ctx->copy_done = true;
 }
 
@@ -182,7 +196,10 @@ static void frame_handle_failed(void *data, struct zwlr_screencopy_frame_v1 *fra
     ctx->frame_failed = true;
 }
 static void frame_handle_damage(void *data, struct zwlr_screencopy_frame_v1 *frame,
-        uint32_t x, uint32_t y, uint32_t width, uint32_t height) {}
+        uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    struct wayland_context *ctx = (struct wayland_context *)data;
+    damage_tracker_add(&ctx->damage, x, y, width, height);
+}
 static void frame_handle_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *frame,
         uint32_t format, uint32_t width, uint32_t height) {}
 static void frame_handle_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *frame) {}
@@ -550,6 +567,10 @@ int main(int argc, char **argv) {
     venc_initialized = true;
     enc = venc.codec_ctx;
     printf("[FluxCast-C Encoder] Intel QuickSync VDENC ASIC engaged at %dx%d@%d!\n", WIDTH, HEIGHT, DEFAULT_FPS);
+    if (venc.roi_max_regions > 0) {
+        printf("[FluxCast-C Encoder] Damage-guided ROI enabled: up to %d regions, QP -%d\n",
+               venc.roi_max_regions, DAMAGE_TRACKER_QP_DELTA);
+    }
 
     if (!g_no_dmabuf && g_wl.screencopy_mgr && g_wl.dmabuf_mgr) {
         DmaBufCaptureConfig cap_cfg = {
@@ -640,12 +661,14 @@ int main(int argc, char **argv) {
     };
     timerfd_settime(timer_fd, 0, &timer_spec, NULL);
 
-    struct timespec t_stream_start, now;
+    struct timespec t_stream_start;
     clock_gettime(CLOCK_MONOTONIC, &t_stream_start);
     int64_t last_pts = -1;
     uint64_t frame_count = 0;
+    uint64_t roi_frames = 0;
+    uint64_t roi_regions_total = 0;
 
-    printf("[FluxCast-C Loop] Streaming live at 60 FPS directly into TV hardware!\n");
+    printf("[FluxCast-C Loop] Streaming live at up to 60 FPS directly into TV hardware!\n");
 
     // Initialize kernel real-time subsystem (locks memory, pre-faults stack, pins to core 2)
     realtime_sys_init(2);
@@ -666,18 +689,13 @@ int main(int argc, char **argv) {
         }
         clock_gettime(CLOCK_MONOTONIC, &t_frame_start);
 
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        int64_t pts_us = (now.tv_sec - t_stream_start.tv_sec) * 1000000LL + (now.tv_nsec - t_stream_start.tv_nsec) / 1000;
-        int64_t pts = (pts_us * 90) / 1000;
-        if (pts <= last_pts) {
-            pts = last_pts + 1;
-        }
-        last_pts = pts;
-
+        int64_t pts = 0;
         net_pacer_frame_begin(&g_pacer);
 
         double t_capture_us = 0;
         double t_convert_us = 0;
+        VideoEncRoi rois[VIDEO_ENC_MAX_ROIS];
+        size_t roi_count = 0;
 
         if (dmabuf_cap) {
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
@@ -693,6 +711,12 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
+            roi_count = dmabuf_capture_get_rois(dmabuf_cap, rois, VIDEO_ENC_MAX_ROIS);
+            if (realtime_sys_elapsed_us(&t_frame_start, &t_stage_end) >
+                NET_PACER_FRAME_BUDGET_NS / 1000.0) {
+                t_frame_start = t_stage_end;
+            }
+            pts = stream_next_pts(&t_stream_start, &last_pts);
 
             // Hardware VPP color conversion (XRGB -> NV12 in GPU hardware, ~0.24ms)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
@@ -719,7 +743,7 @@ int main(int argc, char **argv) {
 
             // Hardware encode (Intel VDENC ASIC direct submit)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_hw_surface(&venc, pts);
+            err = video_enc_send_hw_surface_with_rois(&venc, pts, rois, roi_count);
             if (err < 0) {
                 static int hw_enc_err_cnt = 0;
                 if (++hw_enc_err_cnt % 60 == 1) {
@@ -731,6 +755,7 @@ int main(int argc, char **argv) {
             g_wl.frame_ready = false;
             g_wl.frame_failed = false;
             g_wl.copy_done = false;
+            damage_tracker_reset(&g_wl.damage);
 
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
             struct zwlr_screencopy_frame_v1 *sc_frame =
@@ -775,6 +800,12 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
+            roi_count = damage_tracker_get_rois(&g_wl.damage, rois, VIDEO_ENC_MAX_ROIS);
+            if (realtime_sys_elapsed_us(&t_frame_start, &t_stage_end) >
+                NET_PACER_FRAME_BUDGET_NS / 1000.0) {
+                t_frame_start = t_stage_end;
+            }
+            pts = stream_next_pts(&t_stream_start, &last_pts);
 
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
             int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~1) : WIDTH;
@@ -792,7 +823,7 @@ int main(int argc, char **argv) {
 
             // Hardware encode (DMA upload + Intel VDENC ASIC)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_frame(&venc, sw_frame, pts);
+            err = video_enc_send_frame_with_rois(&venc, sw_frame, pts, rois, roi_count);
             if (err < 0) {
                 static int hw_buf_err_cnt = 0;
                 if (++hw_buf_err_cnt % 60 == 1) {
@@ -854,10 +885,20 @@ int main(int argc, char **argv) {
         double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us + t_pacing_us;
         telemetry_record_frame(&g_telem, t_capture_us, t_convert_us, t_upload_us, t_encode_us, t_pacing_us, t_total_us);
 
+        if (roi_count > 0) {
+            if (roi_frames < 3) {
+                printf("[FluxCast-C ROI] Frame %lu: %zu region(s), QP -%d; first=(%d,%d %dx%d)\n",
+                       (unsigned long)frame_count, roi_count, rois[0].qp_delta,
+                       rois[0].x, rois[0].y, rois[0].width, rois[0].height);
+            }
+            roi_frames++;
+            roi_regions_total += roi_count;
+        }
         frame_count++;
         if (frame_count % 300 == 0) {
-            printf("[FluxCast-C Stream] Transmitted %lu frames (%.1fs uptime, PTS=%ld)\n",
-                   (unsigned long)frame_count, frame_count / 60.0, (long)pts);
+            printf("[FluxCast-C Stream] Transmitted %lu frames (%.1fs PTS uptime, PTS=%ld); ROI on %lu frames (%lu regions total)\n",
+                   (unsigned long)frame_count, pts / 90000.0, (long)pts,
+                   (unsigned long)roi_frames, (unsigned long)roi_regions_total);
             telemetry_print_summary(&g_telem, "[FluxCast-C Telemetry]");
         }
     }

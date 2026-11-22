@@ -3,7 +3,7 @@ CFLAGS ?= -O3 -march=native -fopenmp -fomit-frame-pointer -flto -Wall -Wextra -W
 PKG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil wayland-client libdrm gbm libva libva-drm)
 PKG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil wayland-client libdrm gbm libva libva-drm) -lpthread -lm
 
-SRC = src/wfd_fast.c src/realtime_sys.c src/video_enc.c src/net_pacer.c src/dmabuf_capture.c src/color_convert.c src/wlr-screencopy-unstable-v1-protocol.c src/linux-dmabuf-unstable-v1-protocol.c
+SRC = src/wfd_fast.c src/realtime_sys.c src/video_enc.c src/net_pacer.c src/dmabuf_capture.c src/color_convert.c src/damage_tracker.c src/wlr-screencopy-unstable-v1-protocol.c src/linux-dmabuf-unstable-v1-protocol.c
 BIN = bin/wfd-fast
 BENCH_BIN = bin/bench_video_enc
 BENCH_KERNEL = bin/bench_kernel_sys
@@ -46,6 +46,8 @@ tools: $(BENCH_BIN) $(BENCH_KERNEL) $(BENCH_PACER)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_dmabuf_screencopy.c src/video_enc.c src/color_convert.c src/wlr-screencopy-unstable-v1-protocol.c src/linux-dmabuf-unstable-v1-protocol.c -o bin/test_dmabuf_screencopy $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_capture_speed.c src/wlr-screencopy-unstable-v1-protocol.c -o bin/test_capture_speed $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_fast_nv12.c src/color_convert.c -o bin/test_fast_nv12 $(PKG_LIBS)
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_damage_tracker.c src/damage_tracker.c -o bin/test_damage_tracker $(PKG_LIBS)
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -Isrc tools/test_roi_enc.c src/video_enc.c -o bin/test_roi_enc $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/inspect_pkt3.c -o bin/inspect_pkt3 $(PKG_LIBS)
 	$(CC) $(CFLAGS) tools/query_va_caps.c -o bin/query_va_caps -lva -lva-drm
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/bench_video_enc_suite.c -o bin/bench_video_enc_suite $(PKG_LIBS)

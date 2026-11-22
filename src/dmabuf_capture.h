@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <wayland-client.h>
 #include <va/va.h>
+#include "damage_tracker.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,7 @@ int dmabuf_capture_frame(DmaBufCapture *cap);
  * Returns 0 on success, negative error code on failure.
  */
 int dmabuf_capture_convert_vpp(DmaBufCapture *cap, VASurfaceID dst_surface);
+size_t dmabuf_capture_get_rois(const DmaBufCapture *cap, VideoEncRoi *rois, size_t max_rois);
 
 /*
  * Returns the width of the captured screen.

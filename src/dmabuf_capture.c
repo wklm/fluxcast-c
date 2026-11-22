@@ -54,6 +54,7 @@ struct DmaBufCapture {
     VAConfigID vpp_cfg;
     VAContextID vpp_ctx;
     VARectangle vpp_rect;
+    DamageTracker damage;
 };
 
 static void sc_buffer(void *data, struct zwlr_screencopy_frame_v1 *f,
@@ -69,7 +70,10 @@ static void sc_failed(void *data, struct zwlr_screencopy_frame_v1 *f) {
     cap->frame_failed = 1;
 }
 static void sc_damage(void *data, struct zwlr_screencopy_frame_v1 *f,
-                      uint32_t x, uint32_t y, uint32_t width, uint32_t height) {}
+                      uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    DmaBufCapture *cap = (DmaBufCapture *)data;
+    damage_tracker_add(&cap->damage, x, y, width, height);
+}
 static void sc_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *f,
                             uint32_t format, uint32_t width, uint32_t height) {
     DmaBufCapture *cap = (DmaBufCapture *)data;
@@ -213,6 +217,7 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
         cap->width = cfg->width;
         cap->height = cfg->height;
     }
+    damage_tracker_init(&cap->damage, cap->width, cap->height);
 
     // Step 2: Open DRM device & GBM
     const char *drm_node = cfg->drm_node ? cfg->drm_node : "/dev/dri/renderD128";
@@ -277,13 +282,14 @@ int dmabuf_capture_frame(DmaBufCapture *cap) {
     struct dmabuf_buffer *buf = &cap->bufs[cap->cur_buf];
     cap->frame_ready = 0;
     cap->frame_failed = 0;
+    damage_tracker_reset(&cap->damage);
 
     struct zwlr_screencopy_frame_v1 *frame =
         zwlr_screencopy_manager_v1_capture_output(cap->screencopy_mgr, 1, cap->output);
     if (!frame) return -EIO;
 
     zwlr_screencopy_frame_v1_add_listener(frame, &sc_listener, cap);
-    zwlr_screencopy_frame_v1_copy(frame, buf->wl_buf);
+    zwlr_screencopy_frame_v1_copy_with_damage(frame, buf->wl_buf);
 
     if (wl_display_flush(cap->display) < 0 && errno != EAGAIN && errno != EINTR) {
         zwlr_screencopy_frame_v1_destroy(frame);
@@ -349,6 +355,11 @@ int dmabuf_capture_convert_vpp(DmaBufCapture *cap, VASurfaceID dst_surface) {
     cap->cur_buf ^= 1;
 
     return (st == VA_STATUS_SUCCESS) ? 0 : -EIO;
+}
+
+size_t dmabuf_capture_get_rois(const DmaBufCapture *cap, VideoEncRoi *rois, size_t max_rois) {
+    if (!cap) return 0;
+    return damage_tracker_get_rois(&cap->damage, rois, max_rois);
 }
 
 uint32_t dmabuf_capture_get_width(const DmaBufCapture *cap) {

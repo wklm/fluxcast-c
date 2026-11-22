@@ -33,6 +33,15 @@ extern "C" {
 #define VIDEO_ENC_DEFAULT_PROFILE     AV_PROFILE_H264_HIGH
 #define VIDEO_ENC_DEFAULT_CODER       1
 #define VIDEO_ENC_DEFAULT_DEVICE      "/dev/dri/renderD128"
+#define VIDEO_ENC_MAX_ROIS            3
+
+typedef struct VideoEncRoi {
+    int x;
+    int y;
+    int width;
+    int height;
+    int qp_delta;
+} VideoEncRoi;
 
 typedef struct VideoEncConfig {
     int width;              /* Frame width in pixels (default: 1920) */
@@ -55,6 +64,7 @@ typedef struct VideoEncoder {
     AVCodecContext *codec_ctx;
     const AVCodec *codec;
     AVFrame *hw_frame;
+    int roi_max_regions;
 
     /* Microsecond timings of the most recent encode */
     int64_t last_dma_time_us;
@@ -91,6 +101,8 @@ AVFrame *video_enc_alloc_sw_frame(const VideoEncoder *enc);
  * Returns 0 on success, negative AV error code on failure.
  */
 int video_enc_send_frame(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts);
+int video_enc_send_frame_with_rois(VideoEncoder *enc, AVFrame *sw_frame, int64_t pts,
+                                   const VideoEncRoi *rois, size_t roi_count);
 
 /*
  * Receive an encoded H.264 packet from the hardware encoder.
@@ -130,6 +142,8 @@ int video_enc_get_hw_surface(VideoEncoder *enc, VASurfaceID *out_surface);
  * Returns 0 on success, negative AV error code on failure.
  */
 int video_enc_send_hw_surface(VideoEncoder *enc, int64_t pts);
+int video_enc_send_hw_surface_with_rois(VideoEncoder *enc, int64_t pts,
+                                        const VideoEncRoi *rois, size_t roi_count);
 
 /*
  * Drain remaining packets after flushing.

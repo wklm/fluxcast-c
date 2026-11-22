@@ -8,7 +8,7 @@ A native C streaming engine for Linux Wayland compositors (Niri, Sway, Hyprland,
 
 ### A. Clock Drift Prevention via `CLOCK_MONOTONIC` PTS
 * **The Problem:** Standard pipelines use frame counters (`PTS_n = PTS_{n-1} + 1/60`) or `genpts`. During static desktop moments or slight timing delays, incremental counters drift away from real wall-clock time. The TV's MPEG-TS PCR recovery PLL interprets this as late media and expands its internal jitter buffer, causing latency to grow linearly with session duration.
-* **The Fix:** `wfd-fast` locks PTS to `CLOCK_MONOTONIC` microseconds at the exact moment of timer expiration:
+* **The Fix:** `wfd-fast` locks PTS to `CLOCK_MONOTONIC` microseconds when each damaged frame becomes ready:
   $$\text{PTS} = \frac{(t_{\text{now}} - t_{\text{start}})_{\mu s} \times 90}{1000}$$
   Every packet carries an absolute wall-clock timestamp, strictly monotonic, preventing buffer accumulation and timing drift.
 
@@ -20,6 +20,7 @@ A native C streaming engine for Linux Wayland compositors (Niri, Sway, Hyprland,
 
 ### C. Wayland Screencopy & Color Conversion
 * Integrates directly with `zwlr_screencopy_manager_v1` using zero-copy DMA-BUF capture and Intel VA-API VPP where supported.
+* Uses `copy_with_damage` to capture changed frames and merges damage into up to three macroblock-aligned ROI regions with a QP delta of -3. Broad damage exceeding 25% of the frame uses the global QP to avoid an across-the-frame bitrate increase.
 * Falls back to shared-memory capture and an AVX2 BT.709 limited-range converter with 2x2 chroma averaging.
 
 ### D. RTSP Contract & Source Port Binding
@@ -92,4 +93,6 @@ make tools
 
 * `bin/test_capture_speed`: Tests Wayland screencopy capture roundtrip latency.
 * `bin/test_fast_nv12`: Validates BT.709 conversion against a scalar reference and benchmarks the AVX2 path.
+* `bin/test_damage_tracker`: Tests damage clipping, merging, alignment, and broad-damage suppression.
+* `bin/test_roi_enc`: Checks selective hardware ROI encoding and measures A/B encode latency.
 * `bin/inspect_pkt3`: Analyzes H.264 NAL units and MPEG-TS access units.
