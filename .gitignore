@@ -1,0 +1,8 @@
+bin/
+*.o
+*.a
+*.so
+*.ts
+*.mp4
+*.log
+.DS_Store
