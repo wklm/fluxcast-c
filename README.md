@@ -1,28 +1,28 @@
-# wfd-fast: Ultra-Low-Latency Wayland Miracast Streamer
+# wfd-fast: Wayland Miracast Streamer
 
-A zero-abstraction, high-frequency, native C streaming engine engineered to reach the theoretical lower bound of wireless display latency (~41 ms) on Linux Wayland compositors (Niri, Sway, Hyprland, wlroots) connecting to Smart TVs (Hisense VIDAA OS, Samsung Tizen, LG webOS) via native Wi-Fi Display (Miracast / Anyview Cast).
+A native C streaming engine for Linux Wayland compositors (Niri, Sway, Hyprland, wlroots) connecting to Smart TVs (Hisense VIDAA OS, Samsung Tizen, LG webOS) via Wi-Fi Display (Miracast / Anyview Cast).
 
 ---
 
-## 1. Key Engineering Innovations
+## 1. Implementation Details
 
-### A. Zero Clock Drift via Real-Time `CLOCK_MONOTONIC` PTS
+### A. Clock Drift Prevention via `CLOCK_MONOTONIC` PTS
 * **The Problem:** Standard pipelines use frame counters (`PTS_n = PTS_{n-1} + 1/60`) or `genpts`. During static desktop moments or slight timing delays, incremental counters drift away from real wall-clock time. The TV's MPEG-TS PCR recovery PLL interprets this as late media and expands its internal jitter buffer, causing latency to grow linearly with session duration.
 * **The Fix:** `wfd-fast` locks PTS to `CLOCK_MONOTONIC` microseconds at the exact moment of timer expiration:
   $$\text{PTS} = \frac{(t_{\text{now}} - t_{\text{start}})_{\mu s} \times 90}{1000}$$
-  Every packet carries an absolute wall-clock timestamp, strictly monotonic, permanently preventing buffer accumulation and ensuring latency remains flat indefinitely.
+  Every packet carries an absolute wall-clock timestamp, strictly monotonic, preventing buffer accumulation and timing drift.
 
-### B. Fixed-Function Intel QuickSync VDENC ASIC Hardware Acceleration
-* **Direct Fixed-Function Path:** Configured via `h264_vaapi` with `low_power=1`, bypassing GPU Execution Units (EU) shaders entirely and utilizing Intel's dedicated low-power silicon encoding engine.
-* **Low-Complexity Entropy Coding:** Uses CAVLC (`coder=cavlc`) and Constrained Baseline Profile (`profile=578`) rather than CABAC, cutting TV decoder compute cycles by over 60%.
-* **Zero Rate-Control Delay:** Utilizes Constant Quantization Parameter (`rc_mode=CQP`, `qp=28`), eliminating multi-frame rate control lookahead buffers.
-* **Micro-GOP Sync:** Emits an IDR keyframe with in-band SPS/PPS every 15 frames (250 ms at 60 FPS), enabling instantaneous recovery from packet drops without full pipeline teardowns.
+### B. Hardware Encoding (VA-API / Intel QuickSync)
+* **Fixed-Function Encoding:** Configured via `h264_vaapi` with `low_power=1`, bypassing GPU execution unit shaders and using dedicated low-power encoding hardware.
+* **Low-Complexity Entropy Coding:** Uses CAVLC (`coder=cavlc`) and Constrained Baseline Profile (`profile=578`) rather than CABAC to reduce TV decoder complexity.
+* **Rate Control:** Uses Constant Quantization Parameter (`rc_mode=CQP`, `qp=28`), avoiding multi-frame rate control lookahead buffers.
+* **GOP Synchronization:** Emits an IDR keyframe with in-band SPS/PPS every 15 frames (250 ms at 60 FPS), enabling recovery from packet drops without full pipeline teardowns.
 
-### C. Direct Wayland Screencopy & Multi-Threaded OpenMP Rec.601 Conversion
+### C. Wayland Screencopy & OpenMP Rec.601 Conversion
 * Integrates directly with `zwlr_screencopy_manager_v1` via shared-memory (`memfd_create`) pools.
-* Employs an OpenMP parallel Rec.601 color space converter (`xrgb_to_nv12_fast`) processing 1080p frames in ~2.2 ms across CPU cores.
+* Employs an OpenMP parallel Rec.601 color space converter (`xrgb_to_nv12_fast`) across CPU cores.
 
-### D. Exact RTSP Contract & Source Port Locking
+### D. RTSP Contract & Source Port Binding
 * Miracast sinks enforce strict incoming socket filters based on the negotiated RTSP `SETUP` transport header (`server_port=19002-19003`).
 * Uses `avio_open2` with explicit `AVDictionary` bindings (`local_rtpport=19002`, `local_rtcpport=19003`) to guarantee that all RTP MPEG-TS packets originate from the exact contracted port.
 
@@ -30,16 +30,16 @@ A zero-abstraction, high-frequency, native C streaming engine engineered to reac
 
 ## 2. System & Network Tuning
 
-To achieve the ~41 ms wireless floor, three system-level adjustments are required:
+The following system-level adjustments are recommended:
 
 1. **Eliminate Multi-Channel Concurrency (MCC) Radio Hopping:**
-   * If the laptop's Wi-Fi is connected to a 5 GHz home network while P2P Wi-Fi Direct runs on 2.4 GHz, the single Wi-Fi radio synthesizer must rapidly hop frequencies, introducing periodic 40–200 ms jitter spikes.
+   * If the laptop's Wi-Fi is connected to a 5 GHz home network while P2P Wi-Fi Direct runs on 2.4 GHz, the single Wi-Fi radio synthesizer must hop frequencies, introducing periodic jitter spikes.
    * Fix: Force both home Wi-Fi and P2P onto the 2.4 GHz band:
      ```bash
      nmcli con modify <Home-WiFi-Name> 802-11-wireless.band bg
      ```
 2. **Disable Wi-Fi Power Saving:**
-   * Wireless power management sleeps the radio transceiver between beacons, adding 15–50 ms latency to every packet burst:
+   * Wireless power management sleeps the radio transceiver between beacons, introducing latency to packet bursts:
      ```bash
      sudo iw dev wlp1s0 set power_save off
      ```
@@ -49,7 +49,7 @@ To achieve the ~41 ms wireless floor, three system-level adjustments are require
      echo 800 | sudo tee /sys/class/drm/card0/gt_min_freq_mhz
      ```
 4. **Set TV Picture Mode to "Game" or "PC":**
-   * Standard TV picture modes apply Motion Estimation / Motion Compensation (MEMC) and noise filtering, buffering 80–140 ms inside the TV panel firmware. Game Mode disables these buffers completely.
+   * Standard TV picture modes apply Motion Estimation / Motion Compensation (MEMC) and noise filtering, adding buffering delays in TV panel firmware. Game Mode bypasses these buffers.
 
 ---
 
@@ -83,13 +83,13 @@ scripts/fluxcast-tv.sh
 
 ---
 
-## 4. Benchmarking & Diagnostics
+## 4. Diagnostics & Testing
 
 Build the diagnostic test suite:
 ```bash
 make tools
 ```
 
-* `bin/test_capture_speed`: Measures raw Wayland screencopy capture roundtrip latency (typically 5.7 ms).
-* `bin/test_fast_nv12`: Measures OpenMP SIMD color space converter speed (typically 2.2 ms for 1080p).
+* `bin/test_capture_speed`: Tests Wayland screencopy capture roundtrip latency.
+* `bin/test_fast_nv12`: Tests OpenMP color space conversion.
 * `bin/inspect_pkt3`: Analyzes H.264 NAL units and MPEG-TS access units.
