@@ -25,7 +25,7 @@
 #define BENCH_RX_PORT           19002
 
 #define GOP_SIZE                30           /* One IDR every 500 ms at 60 FPS */
-#define IDR_PACKETS             64           /* ~85 KB keyframe */
+#define IDR_PACKETS             128          /* ~170 KB keyframe observed on the real link */
 #define P_PACKETS               26           /* ~34.5 KB delta frame */
 #define MAX_TOTAL_PACKETS       (BENCH_FRAMES * IDR_PACKETS)
 

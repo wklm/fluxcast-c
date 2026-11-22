@@ -61,9 +61,8 @@ int net_pacer_init(net_pacer_t *pacer, const net_pacer_cfg_t *cfg) {
                 prio, strerror(errno));
     }
 
-    // 5. Set SO_SNDBUF = 65536 (64 KB) to eliminate bufferbloat
-    // A compact socket buffer forces pacing backpressure onto application userspace
-    // rather than kernel memory queues.
+    // Large IDRs can exceed 100 KB and otherwise block inside sendto() once
+    // per GOP. Capacity does not set the departure rate; the pacer still does.
     int sndbuf = NET_PACER_SO_SNDBUF;
     if (setsockopt(pacer->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
         fprintf(stderr, "[FluxCast-C NetPacer] Warning: Failed to set SO_SNDBUF=%d: %s\n",
