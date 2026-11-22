@@ -12,7 +12,7 @@ PREFIX ?= $(HOME)/.local
 
 .PHONY: all clean install tools bench_net_pacer
 
-all: $(BIN) $(BENCH_KERNEL) $(BENCH_PACER)
+all: $(BIN) $(BENCH_BIN) $(BENCH_KERNEL) $(BENCH_PACER)
 
 $(BIN): $(SRC)
 	@mkdir -p bin

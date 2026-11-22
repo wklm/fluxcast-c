@@ -573,10 +573,12 @@ int main(int argc, char **argv) {
     enc_cfg.width = WIDTH;
     enc_cfg.height = HEIGHT;
     enc_cfg.fps = DEFAULT_FPS;
-    enc_cfg.qp = 28;
-    enc_cfg.gop_size = 15;
+    enc_cfg.qp = VIDEO_ENC_DEFAULT_QP;
+    enc_cfg.gop_size = VIDEO_ENC_DEFAULT_GOP_SIZE;
     enc_cfg.slices = 1;
-    enc_cfg.quality = 7;
+    enc_cfg.quality = VIDEO_ENC_DEFAULT_QUALITY;
+    enc_cfg.profile = VIDEO_ENC_DEFAULT_PROFILE;
+    enc_cfg.coder = VIDEO_ENC_DEFAULT_CODER;
     enc_cfg.async_depth = 1;
     enc_cfg.device_path = "/dev/dri/renderD128";
 
@@ -730,6 +732,7 @@ int main(int argc, char **argv) {
 
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (t_capture_us < 0.0) t_capture_us = 0.0;
 
         if (g_wl.frame_failed || !g_wl.frame_ready) {
             static uint32_t failed_consecutive = 0;
@@ -753,6 +756,7 @@ int main(int argc, char **argv) {
         g_wl.cur_buf ^= 1;
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (t_convert_us < 0.0) t_convert_us = 0.0;
 
         // Hardware encode (DMA upload + Intel VDENC ASIC)
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
@@ -787,13 +791,17 @@ int main(int argc, char **argv) {
         }
         avio_flush(out_ctx->pb);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_encode_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        double total_hw_elapsed = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (total_hw_elapsed < 0.0) total_hw_elapsed = 0.0;
         double t_upload_us = (double)venc.last_dma_time_us;
+        if (t_upload_us < 0.0) t_upload_us = 0.0;
+        if (t_upload_us > total_hw_elapsed) t_upload_us = total_hw_elapsed;
+        double t_encode_us = total_hw_elapsed - t_upload_us;
 
         // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
-        uint64_t elapsed_ns = (uint64_t)(t_elapsed_frame_us * 1000.0);
+        uint64_t elapsed_ns = (t_elapsed_frame_us > 0.0) ? (uint64_t)(t_elapsed_frame_us * 1000.0) : 0ULL;
         uint64_t frame_period_ns = 16666667ULL;
         uint64_t safety_margin_ns = 2000000ULL;
         uint64_t budget_ns;
@@ -808,6 +816,7 @@ int main(int argc, char **argv) {
         net_pacer_send_frame(&g_pacer);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_pacing_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (t_pacing_us < 0.0) t_pacing_us = 0.0;
 
         double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us + t_pacing_us;
         telemetry_record_frame(&g_telem, t_capture_us, t_convert_us, t_upload_us, t_encode_us, t_pacing_us, t_total_us);
