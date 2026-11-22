@@ -174,6 +174,19 @@ static inline void xrgb_to_nv12_ultra(const uint32_t *src, int w, int h, int str
 }
 
 // Screencopy Callbacks with dynamic dimension/stride recreation and leak-free memfd handling
+static void shm_handle_format(void *data, struct wl_shm *shm, uint32_t format) {}
+static const struct wl_shm_listener shm_listener = {
+    .format = shm_handle_format,
+};
+
+static void dmabuf_handle_format(void *data, struct zwp_linux_dmabuf_v1 *dmabuf, uint32_t format) {}
+static void dmabuf_handle_modifier(void *data, struct zwp_linux_dmabuf_v1 *dmabuf, uint32_t format,
+                                   uint32_t modifier_hi, uint32_t modifier_lo) {}
+static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
+    .format = dmabuf_handle_format,
+    .modifier = dmabuf_handle_modifier,
+};
+
 static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
         uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
     struct wayland_context *ctx = (struct wayland_context *)data;
@@ -261,10 +274,12 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     struct wayland_context *ctx = (struct wayland_context *)data;
     if (strcmp(interface, wl_shm_interface.name) == 0) {
         ctx->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+        wl_shm_add_listener(ctx->shm, &shm_listener, ctx);
     } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
         ctx->screencopy_mgr = wl_registry_bind(registry, name, &zwlr_screencopy_manager_v1_interface, (version >= 3) ? 3 : version);
     } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
         ctx->dmabuf_mgr = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, (version >= 3) ? 3 : version);
+        zwp_linux_dmabuf_v1_add_listener(ctx->dmabuf_mgr, &dmabuf_listener, ctx);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (!ctx->output) {
             ctx->output = wl_registry_bind(registry, name, &wl_output_interface, 1);
@@ -590,10 +605,12 @@ int main(int argc, char **argv) {
     enc_cfg.width = WIDTH;
     enc_cfg.height = HEIGHT;
     enc_cfg.fps = DEFAULT_FPS;
-    enc_cfg.qp = 28;
-    enc_cfg.gop_size = 15;
+    enc_cfg.qp = VIDEO_ENC_DEFAULT_QP;
+    enc_cfg.gop_size = VIDEO_ENC_DEFAULT_GOP_SIZE;
     enc_cfg.slices = 1;
-    enc_cfg.quality = 7;
+    enc_cfg.quality = VIDEO_ENC_DEFAULT_QUALITY;
+    enc_cfg.profile = VIDEO_ENC_DEFAULT_PROFILE;
+    enc_cfg.coder = VIDEO_ENC_DEFAULT_CODER;
     enc_cfg.async_depth = 1;
     enc_cfg.device_path = "/dev/dri/renderD128";
 
@@ -763,6 +780,7 @@ int main(int argc, char **argv) {
             err = dmabuf_capture_convert_vpp(dmabuf_cap, dst_surface);
             clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
             t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+            if (t_convert_us < 0.0) t_convert_us = 0.0;
             if (err < 0) {
                 static int vpp_err_cnt = 0;
                 if (++vpp_err_cnt % 60 == 1) {
@@ -818,6 +836,7 @@ int main(int argc, char **argv) {
 
             clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
             t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+            if (t_capture_us < 0.0) t_capture_us = 0.0;
 
             if (g_wl.frame_failed || !g_wl.frame_ready) {
                 static uint32_t failed_consecutive = 0;
@@ -841,6 +860,7 @@ int main(int argc, char **argv) {
             g_wl.cur_buf ^= 1;
             clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
             t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+            if (t_convert_us < 0.0) t_convert_us = 0.0;
 
             // Hardware encode (DMA upload + Intel VDENC ASIC)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
@@ -876,13 +896,17 @@ int main(int argc, char **argv) {
         }
         avio_flush(out_ctx->pb);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_encode_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        double total_hw_elapsed = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (total_hw_elapsed < 0.0) total_hw_elapsed = 0.0;
         double t_upload_us = (double)venc.last_dma_time_us;
+        if (t_upload_us < 0.0) t_upload_us = 0.0;
+        if (t_upload_us > total_hw_elapsed) t_upload_us = total_hw_elapsed;
+        double t_encode_us = total_hw_elapsed - t_upload_us;
 
         // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
-        uint64_t elapsed_ns = (uint64_t)(t_elapsed_frame_us * 1000.0);
+        uint64_t elapsed_ns = (t_elapsed_frame_us > 0.0) ? (uint64_t)(t_elapsed_frame_us * 1000.0) : 0ULL;
         uint64_t frame_period_ns = 16666667ULL;
         uint64_t safety_margin_ns = 2000000ULL;
         uint64_t budget_ns;
@@ -897,6 +921,7 @@ int main(int argc, char **argv) {
         net_pacer_send_frame(&g_pacer);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_pacing_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        if (t_pacing_us < 0.0) t_pacing_us = 0.0;
 
         double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us + t_pacing_us;
         telemetry_record_frame(&g_telem, t_capture_us, t_convert_us, t_upload_us, t_encode_us, t_pacing_us, t_total_us);

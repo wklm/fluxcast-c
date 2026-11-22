@@ -121,9 +121,14 @@ int realtime_sys_init(int target_cpu_core) {
             printf("[FluxCast-C Realtime] SCHED_FIFO unavailable (%s), fallback to setpriority(PRIO_PROCESS, -20) succeeded\n",
                    strerror(fifo_err));
         } else {
+            int nice_err = errno;
             g_rt_status.sched_nice_ok = false;
             printf("[FluxCast-C Realtime] Notice: SCHED_FIFO (%s) and setpriority -20 (%s) unavailable. Standard priority retained.\n",
-                   strerror(fifo_err), strerror(errno));
+                   strerror(fifo_err), strerror(nice_err));
+            if (g_rt_status.affinity_ok) {
+                fprintf(stderr, "[FluxCast-C Realtime] Warning: Core pinning (CPU %d) without real-time priority under CFS can cause jitter spikes if other background tasks share that core.\n",
+                        g_rt_status.target_cpu_core);
+            }
         }
     }
 

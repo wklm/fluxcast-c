@@ -39,6 +39,7 @@ struct DmaBufCapture {
 
     int drm_fd;
     struct gbm_device *gbm;
+    bool va_dpy_owned;
 
     uint32_t width;
     uint32_t height;
@@ -101,6 +102,10 @@ static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
     }
 
     b->prime_fd = gbm_bo_get_fd(b->bo);
+    if (b->prime_fd < 0) {
+        fprintf(stderr, "[dmabuf_capture] Error: gbm_bo_get_fd failed: %s\n", strerror(errno));
+        return -1;
+    }
     b->stride = gbm_bo_get_stride(b->bo);
     b->modifier = gbm_bo_get_modifier(b->bo);
 
@@ -147,6 +152,15 @@ static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
     b->va_surface = VA_INVALID_ID;
     VAStatus st = vaCreateSurfaces(cap->va_dpy, VA_RT_FORMAT_RGB32, cap->width, cap->height,
                                    &b->va_surface, 1, attribs, 2);
+
+    /*
+     * The PRIME fd has been exported to Wayland (sendmsg) and imported into VA-API (drmPrimeFDToHandle).
+     * Both sides hold their respective kernel/driver references. Close the PRIME fd immediately
+     * to eliminate lingering file descriptors.
+     */
+    close(b->prime_fd);
+    b->prime_fd = -1;
+
     if (st != VA_STATUS_SUCCESS) {
         fprintf(stderr, "[dmabuf_capture] Error: vaCreateSurfaces (DRM_PRIME_2) failed: %d (%s)\n",
                 st, vaErrorStr(st));
@@ -225,6 +239,7 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
             dmabuf_capture_destroy(cap);
             return -EIO;
         }
+        cap->va_dpy_owned = true;
     }
 
     // Step 3: Initialize DMA-BUF buffers
@@ -340,6 +355,10 @@ uint32_t dmabuf_capture_get_height(const DmaBufCapture *cap) {
 void dmabuf_capture_destroy(DmaBufCapture *cap) {
     if (!cap) return;
 
+    if (cap->display) {
+        wl_display_roundtrip(cap->display);
+    }
+
     if (cap->vpp_ctx != VA_INVALID_ID) {
         vaDestroyContext(cap->va_dpy, cap->vpp_ctx);
         cap->vpp_ctx = VA_INVALID_ID;
@@ -372,9 +391,17 @@ void dmabuf_capture_destroy(DmaBufCapture *cap) {
         gbm_device_destroy(cap->gbm);
         cap->gbm = NULL;
     }
+    if (cap->va_dpy_owned && cap->va_dpy) {
+        vaTerminate(cap->va_dpy);
+        cap->va_dpy = NULL;
+    }
     if (cap->drm_fd >= 0) {
         close(cap->drm_fd);
         cap->drm_fd = -1;
+    }
+
+    if (cap->display) {
+        wl_display_flush(cap->display);
     }
 
     free(cap);

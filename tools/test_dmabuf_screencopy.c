@@ -154,11 +154,29 @@ static const struct zwlr_screencopy_frame_v1_listener sc_listener = {
     .damage = sc_damage, .linux_dmabuf = sc_linux_dmabuf, .buffer_done = sc_buffer_done
 };
 
+static void shm_handle_format(void *data, struct wl_shm *s, uint32_t format) {}
+static const struct wl_shm_listener shm_listener = { .format = shm_handle_format };
+
+static void dmabuf_handle_format(void *data, struct zwp_linux_dmabuf_v1 *d, uint32_t format) {}
+static void dmabuf_handle_modifier(void *data, struct zwp_linux_dmabuf_v1 *d, uint32_t format,
+                                   uint32_t modifier_hi, uint32_t modifier_lo) {}
+static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
+    .format = dmabuf_handle_format,
+    .modifier = dmabuf_handle_modifier,
+};
+
 static void reg_global(void *data, struct wl_registry *reg, uint32_t name, const char *interface, uint32_t version) {
-    if (strcmp(interface, wl_shm_interface.name) == 0) shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
-    else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) screencopy_mgr = wl_registry_bind(reg, name, &zwlr_screencopy_manager_v1_interface, 3);
-    else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) dmabuf_mgr = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface, 3);
-    else if (strcmp(interface, wl_output_interface.name) == 0) if (!output) output = wl_registry_bind(reg, name, &wl_output_interface, 1);
+    if (strcmp(interface, wl_shm_interface.name) == 0) {
+        shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+        wl_shm_add_listener(shm, &shm_listener, NULL);
+    } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+        screencopy_mgr = wl_registry_bind(reg, name, &zwlr_screencopy_manager_v1_interface, 3);
+    } else if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+        dmabuf_mgr = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface, 3);
+        zwp_linux_dmabuf_v1_add_listener(dmabuf_mgr, &dmabuf_listener, NULL);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        if (!output) output = wl_registry_bind(reg, name, &wl_output_interface, 1);
+    }
 }
 static void reg_remove(void *data, struct wl_registry *reg, uint32_t name) {}
 static const struct wl_registry_listener reg_listener = { .global = reg_global, .global_remove = reg_remove };
@@ -199,8 +217,10 @@ int main(int argc, char **argv) {
     enc_cfg.width = width;
     enc_cfg.height = height;
     enc_cfg.fps = 60;
-    enc_cfg.qp = 26;
-    enc_cfg.gop_size = 15;
+    enc_cfg.qp = VIDEO_ENC_DEFAULT_QP;
+    enc_cfg.gop_size = VIDEO_ENC_DEFAULT_GOP_SIZE;
+    enc_cfg.profile = VIDEO_ENC_DEFAULT_PROFILE;
+    enc_cfg.coder = VIDEO_ENC_DEFAULT_CODER;
     enc_cfg.slices = 1;
     enc_cfg.quality = 7;
     enc_cfg.async_depth = 1;
@@ -319,6 +339,9 @@ int main(int argc, char **argv) {
             {.type = VASurfaceAttribExternalBufferDescriptor, .flags = VA_SURFACE_ATTRIB_SETTABLE, .value = {.type = VAGenericValueTypePointer, .value.p = &desc}}
         };
         vaCreateSurfaces(va_dpy, VA_RT_FORMAT_RGB32, width, height, &dmabuf_bufs[k].va_surf, 1, attr, 2);
+        // PRIME fd has been exported to Wayland and imported to VA-API. Close it immediately.
+        close(dmabuf_bufs[k].pfd);
+        dmabuf_bufs[k].pfd = -1;
     }
 
     VAConfigID vpp_cfg;
@@ -443,13 +466,17 @@ int main(int argc, char **argv) {
     free(b_cap); free(b_conv); free(b_upload); free(b_enc); free(b_total);
     free(z_cap); free(z_conv); free(z_upload); free(z_enc); free(z_total);
 
+    if (display) {
+        wl_display_roundtrip(display);
+    }
+
     vaDestroyContext(va_dpy, vpp_ctx);
     vaDestroyConfig(va_dpy, vpp_cfg);
     for (int k = 0; k < 2; k++) {
         vaDestroySurfaces(va_dpy, &dmabuf_bufs[k].va_surf, 1);
         wl_buffer_destroy(dmabuf_bufs[k].wl_buf);
         gbm_bo_destroy(dmabuf_bufs[k].bo);
-        close(dmabuf_bufs[k].pfd);
+        if (dmabuf_bufs[k].pfd >= 0) close(dmabuf_bufs[k].pfd);
     }
     gbm_device_destroy(gbm);
     close(drm_fd);

@@ -12,7 +12,7 @@ PREFIX ?= $(HOME)/.local
 
 .PHONY: all clean install tools bench_net_pacer
 
-all: $(BIN) $(BENCH_KERNEL) $(BENCH_PACER)
+all: $(BIN) $(BENCH_BIN) $(BENCH_KERNEL) $(BENCH_PACER)
 
 $(BIN): $(SRC)
 	@mkdir -p bin
@@ -48,6 +48,7 @@ tools: $(BENCH_BIN) $(BENCH_KERNEL) $(BENCH_PACER)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/test_fast_nv12.c -o bin/test_fast_nv12 $(PKG_LIBS)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/inspect_pkt3.c -o bin/inspect_pkt3 $(PKG_LIBS)
 	$(CC) $(CFLAGS) tools/query_va_caps.c -o bin/query_va_caps -lva -lva-drm
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) tools/bench_video_enc_suite.c -o bin/bench_video_enc_suite $(PKG_LIBS)
 	@echo "Tools built in bin/"
 
 clean:

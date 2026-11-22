@@ -12,8 +12,8 @@
 #define TEST_WIDTH   1920
 #define TEST_HEIGHT  1080
 #define TEST_FPS     60
-#define TEST_QP      26
-#define TEST_GOP     15
+#define TEST_QP      VIDEO_ENC_DEFAULT_QP
+#define TEST_GOP     VIDEO_ENC_DEFAULT_GOP_SIZE
 
 typedef struct {
     int nal_count;
@@ -245,7 +245,7 @@ int main(int argc, char **argv) {
     printf("================================================================================\n");
     printf(" FluxCast-C: Hardware H.264 Encoder Microsecond Rigorous Benchmark\n");
     printf(" Platform: Intel Kaby Lake Gen9.5 GT2 (HD Graphics 620 / iHD VA-API)\n");
-    printf(" Mode: VAEntrypointEncSliceLP | low_power=1 | async_depth=1 | slices=1 | CQP qp=26\n");
+    printf(" Mode: VAEntrypointEncSliceLP | low_power=1 | async_depth=1 | slices=1 | CQP\n");
     printf("================================================================================\n\n");
 
     VideoEncConfig cfg;
@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
     cfg.qp          = TEST_QP;
     cfg.gop_size    = TEST_GOP;
     cfg.slices      = 1;
-    cfg.quality     = 7;
+    cfg.quality     = VIDEO_ENC_DEFAULT_QUALITY;
     cfg.async_depth = 1;
 
     VideoEncoder enc;
@@ -268,8 +268,9 @@ int main(int argc, char **argv) {
     }
     printf("      -> VA-API Context: SUCCESS (/dev/dri/renderD128)\n");
     printf("      -> Hardware Pipeline: Intel VDENC Fixed-Function ASIC\n");
-    printf("      -> Parameters: %dx%d @ %d fps | GOP=%d | QP=%d | Profile=578 (CHP) | Coder=CAVLC\n\n",
-           cfg.width, cfg.height, cfg.fps, cfg.gop_size, cfg.qp);
+    printf("      -> Parameters: %dx%d @ %d fps | GOP=%d | QP=%d | Profile=%d | Coder=%s\n\n",
+           cfg.width, cfg.height, cfg.fps, cfg.gop_size, cfg.qp, cfg.profile,
+           cfg.coder == 1 ? "CABAC" : "CAVLC");
 
     AVFrame *sw_frame = video_enc_alloc_sw_frame(&enc);
     if (!sw_frame) {
