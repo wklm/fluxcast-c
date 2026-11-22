@@ -89,9 +89,6 @@ typedef struct {
     net_pacer_packet_t packets[NET_PACER_MAX_FRAME_PACKETS];
     uint32_t           num_packets;
 
-    /* Timestamp when frame accumulation begins */
-    struct timespec    frame_start_ts;
-
     /* Cumulative metrics */
     net_pacer_stats_t  stats;
 } net_pacer_t;
@@ -134,8 +131,7 @@ void net_pacer_set_budget_ns(net_pacer_t *pacer, uint64_t pacing_budget_ns);
 int  net_pacer_set_destination(net_pacer_t *pacer, const char *dest_ip, uint16_t dest_port);
 
 /**
- * Begin a new frame accumulation cycle:
- * Clears packet buffer and records frame start timestamp.
+ * Begin a new frame accumulation cycle by clearing the packet buffer.
  */
 int  net_pacer_frame_begin(net_pacer_t *pacer);
 
@@ -148,7 +144,8 @@ int  net_pacer_frame_begin(net_pacer_t *pacer);
 int  net_pacer_queue_packet(net_pacer_t *pacer, const void *data, size_t len);
 
 /**
- * Dispatches all accumulated packets for the current frame:
+ * Dispatches all accumulated packets for the current frame, using the dispatch
+ * timestamp rather than the earlier capture/encode start as the pacing origin:
  * - If pacing enabled: spreads N packets evenly across pacing_budget_ns (13.33 ms)
  *   with delta_t = pacing_budget_ns / N using clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...).
  * - If pacing disabled: burst sends all packets immediately back-to-back.

@@ -13,14 +13,14 @@ A native C streaming engine for Linux Wayland compositors (Niri, Sway, Hyprland,
   Every packet carries an absolute wall-clock timestamp, strictly monotonic, preventing buffer accumulation and timing drift.
 
 ### B. Hardware Encoding (VA-API / Intel QuickSync)
-* **Fixed-Function Encoding:** Configured via `h264_vaapi` with `low_power=1`, bypassing GPU execution unit shaders and using dedicated low-power encoding hardware.
-* **Low-Complexity Entropy Coding:** Uses CAVLC (`coder=cavlc`) and Constrained Baseline Profile (`profile=578`) rather than CABAC to reduce TV decoder complexity.
-* **Rate Control:** Uses Constant Quantization Parameter (`rc_mode=CQP`, `qp=28`), avoiding multi-frame rate control lookahead buffers.
-* **GOP Synchronization:** Emits an IDR keyframe with in-band SPS/PPS every 15 frames (250 ms at 60 FPS), enabling recovery from packet drops without full pipeline teardowns.
+* **Fixed-Function Encoding:** Configured via `h264_vaapi` with `low_power=1`, High Profile (`profile=100`), and CABAC entropy coding.
+* **Rate Control:** Uses Constant Quantization Parameter (`rc_mode=CQP`, `qp=22`), avoiding multi-frame rate control lookahead buffers.
+* **GOP Synchronization:** Emits an IDR keyframe with in-band SPS/PPS every 30 frames (500 ms at 60 FPS), enabling recovery from packet drops without full pipeline teardowns.
+* **Color Signaling:** Encodes BT.709 limited-range video and declares the matrix, primaries, transfer characteristics, and range in the H.264 SPS VUI.
 
-### C. Wayland Screencopy & OpenMP Rec.601 Conversion
-* Integrates directly with `zwlr_screencopy_manager_v1` via shared-memory (`memfd_create`) pools.
-* Employs an OpenMP parallel Rec.601 color space converter (`xrgb_to_nv12_fast`) across CPU cores.
+### C. Wayland Screencopy & Color Conversion
+* Integrates directly with `zwlr_screencopy_manager_v1` using zero-copy DMA-BUF capture and Intel VA-API VPP where supported.
+* Falls back to shared-memory capture and an AVX2 BT.709 limited-range converter with 2x2 chroma averaging.
 
 ### D. RTSP Contract & Source Port Binding
 * Miracast sinks enforce strict incoming socket filters based on the negotiated RTSP `SETUP` transport header (`server_port=19002-19003`).
@@ -91,5 +91,5 @@ make tools
 ```
 
 * `bin/test_capture_speed`: Tests Wayland screencopy capture roundtrip latency.
-* `bin/test_fast_nv12`: Tests OpenMP color space conversion.
+* `bin/test_fast_nv12`: Validates BT.709 conversion against a scalar reference and benchmarks the AVX2 path.
 * `bin/inspect_pkt3`: Analyzes H.264 NAL units and MPEG-TS access units.

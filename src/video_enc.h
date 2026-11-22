@@ -18,7 +18,7 @@ extern "C" {
  *
  * Sweet spot configuration (Pareto frontier):
  * - QP 22: +3.03 dB PSNR visual improvement at 0% latency regression
- * - Main Profile 77 + CABAC: 14-17% bitrate reduction, 0% ASIC latency cost
+ * - High Profile 100 + CABAC: enables the 8x8 transform for screen content
  * - GOP 30: 500ms keyframe cadence cuts IDR network burst bandwidth in half
  * - Quality 7: strictly preserves 2.6ms VDENC hardware pass
  */
@@ -30,7 +30,7 @@ extern "C" {
 #define VIDEO_ENC_DEFAULT_SLICES      1
 #define VIDEO_ENC_DEFAULT_QUALITY     7
 #define VIDEO_ENC_DEFAULT_ASYNC_DEPTH 1
-#define VIDEO_ENC_DEFAULT_PROFILE     77
+#define VIDEO_ENC_DEFAULT_PROFILE     AV_PROFILE_H264_HIGH
 #define VIDEO_ENC_DEFAULT_CODER       1
 #define VIDEO_ENC_DEFAULT_DEVICE      "/dev/dri/renderD128"
 
@@ -43,7 +43,7 @@ typedef struct VideoEncConfig {
     int slices;             /* Slices per frame (default: 1) */
     int quality;            /* Hardware quality level: 1 (best) to 7 (fastest) (default: 7) */
     int async_depth;        /* Frames in GPU flight (default: 1) */
-    int profile;            /* H.264 profile: 578 (CBP), 77 (Main), 100 (High) (default: 77) */
+    int profile;            /* H.264 profile: 578 (CBP), 77 (Main), 100 (High) (default: 100) */
     int coder;              /* Entropy coder: 0 (CAVLC), 1 (CABAC) (default: 1) */
     const char *device_path;/* VA-API render device node (default: "/dev/dri/renderD128") */
 } VideoEncConfig;
@@ -70,18 +70,8 @@ void video_enc_config_default(VideoEncConfig *config);
 
 /*
  * Initialize VA-API hardware context, NV12 surface pool, and H.264 encoder.
- * Strictly enforces:
- *  - profile = 578 (Constrained Baseline / CHP)
- *  - coder = cavlc
- *  - rc_mode = CQP
- *  - qp = 26
- *  - low_power = 1 (Intel VDENC fixed-function ASIC)
- *  - async_depth = 1 (strictly 1 frame in GPU flight)
- *  - quality = 7 (fastest hardware pass)
- *  - slices = 1 (prevents +87.4% bitrate bloat from driver row rounding)
- *  - flags |= AV_CODEC_FLAG_LOW_DELAY, flags2 |= AV_CODEC_FLAG2_FAST
- *  - sei = recovery_point
- *  - gop_size = 15
+ * Uses High Profile with CABAC, CQP 22, a 30-frame GOP, and BT.709 limited-range
+ * VUI signaling by default.
  *
  * Returns 0 on success, negative AV error code on failure.
  */

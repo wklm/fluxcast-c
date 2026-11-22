@@ -10,7 +10,6 @@
 #include <time.h>
 #include <math.h>
 #include <sys/mman.h>
-#include <immintrin.h>
 #include <gbm.h>
 #include <drm_fourcc.h>
 #include <wayland-client.h>
@@ -23,6 +22,7 @@
 #include <libavutil/hwcontext_vaapi.h>
 
 #include "video_enc.h"
+#include "color_convert.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
@@ -30,75 +30,6 @@ static inline double elapsed_us(const struct timespec *start, const struct times
     return (double)(end->tv_sec - start->tv_sec) * 1000000.0 + (double)(end->tv_nsec - start->tv_nsec) / 1000.0;
 }
 
-// AVX2 SIMD XRGB8888 -> NV12 converter (Rec.601)
-static inline void xrgb_to_nv12_ultra(const uint32_t *src, int w, int h, int stride_pixels,
-                                      uint8_t *y_plane, int y_stride,
-                                      uint8_t *uv_plane, int uv_stride) {
-    const __m256i mask_b = _mm256_set1_epi32(0x000000ff);
-    const __m256i mask_g = _mm256_set1_epi32(0x0000ff00);
-    const __m256i mask_r = _mm256_set1_epi32(0x00ff0000);
-
-    const __m256i coeff_yr = _mm256_set1_epi32(66);
-    const __m256i coeff_yg = _mm256_set1_epi32(129);
-    const __m256i coeff_yb = _mm256_set1_epi32(25);
-    const __m256i bias_y   = _mm256_set1_epi32(128 + (16 << 8));
-
-    for (int y = 0; y < h; y += 2) {
-        const uint32_t *r0 = src + y * stride_pixels;
-        const uint32_t *r1 = src + (y + 1) * stride_pixels;
-        uint8_t *y0 = y_plane + y * y_stride;
-        uint8_t *y1 = y_plane + (y + 1) * y_stride;
-        uint8_t *uv = uv_plane + (y / 2) * uv_stride;
-
-        for (int x = 0; x < w; x += 8) {
-            __m256i p0 = _mm256_loadu_si256((const __m256i *)(r0 + x));
-            __m256i p1 = _mm256_loadu_si256((const __m256i *)(r1 + x));
-
-            __m256i b0 = _mm256_and_si256(p0, mask_b);
-            __m256i g0 = _mm256_srli_epi32(_mm256_and_si256(p0, mask_g), 8);
-            __m256i r0_c = _mm256_srli_epi32(_mm256_and_si256(p0, mask_r), 16);
-
-            __m256i y0_val = _mm256_srli_epi32(_mm256_add_epi32(
-                _mm256_add_epi32(_mm256_mullo_epi32(r0_c, coeff_yr), _mm256_mullo_epi32(g0, coeff_yg)),
-                _mm256_add_epi32(_mm256_mullo_epi32(b0, coeff_yb), bias_y)
-            ), 8);
-
-            __m256i b1 = _mm256_and_si256(p1, mask_b);
-            __m256i g1 = _mm256_srli_epi32(_mm256_and_si256(p1, mask_g), 8);
-            __m256i r1_c = _mm256_srli_epi32(_mm256_and_si256(p1, mask_r), 16);
-
-            __m256i y1_val = _mm256_srli_epi32(_mm256_add_epi32(
-                _mm256_add_epi32(_mm256_mullo_epi32(r1_c, coeff_yr), _mm256_mullo_epi32(g1, coeff_yg)),
-                _mm256_add_epi32(_mm256_mullo_epi32(b1, coeff_yb), bias_y)
-            ), 8);
-
-            __m128i y0_lo = _mm256_castsi256_si128(y0_val);
-            __m128i y0_hi = _mm256_extracti128_si256(y0_val, 1);
-            __m128i y0_16 = _mm_packus_epi32(y0_lo, y0_hi);
-            __m128i y0_8  = _mm_packus_epi16(y0_16, y0_16);
-            _mm_storel_epi64((__m128i *)(y0 + x), y0_8);
-
-            __m128i y1_lo = _mm256_castsi256_si128(y1_val);
-            __m128i y1_hi = _mm256_extracti128_si256(y1_val, 1);
-            __m128i y1_16 = _mm_packus_epi32(y1_lo, y1_hi);
-            __m128i y1_8  = _mm_packus_epi16(y1_16, y1_16);
-            _mm_storel_epi64((__m128i *)(y1 + x), y1_8);
-
-            __m256i r_avg = _mm256_srli_epi32(_mm256_add_epi32(r0_c, r1_c), 1);
-            __m256i g_avg = _mm256_srli_epi32(_mm256_add_epi32(g0, g1), 1);
-            __m256i b_avg = _mm256_srli_epi32(_mm256_add_epi32(b0, b1), 1);
-
-            for (int k = 0; k < 8; k += 2) {
-                int r_2x2 = (_mm256_extract_epi32(r_avg, k) + _mm256_extract_epi32(r_avg, k + 1)) >> 1;
-                int g_2x2 = (_mm256_extract_epi32(g_avg, k) + _mm256_extract_epi32(g_avg, k + 1)) >> 1;
-                int b_2x2 = (_mm256_extract_epi32(b_avg, k) + _mm256_extract_epi32(b_avg, k + 1)) >> 1;
-
-                uv[x + k]     = (uint8_t)(((-38 * r_2x2 -  74 * g_2x2 + 112 * b_2x2 + 128) >> 8) + 128);
-                uv[x + k + 1] = (uint8_t)((( 112 * r_2x2 -  94 * g_2x2 -  18 * b_2x2 + 128) >> 8) + 128);
-            }
-        }
-    }
-}
 
 typedef struct {
     double min, max, mean, p50, p95, p99;
@@ -268,10 +199,9 @@ int main(int argc, char **argv) {
         zwlr_screencopy_frame_v1_destroy(f);
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
-        // AVX2 conversion
-        xrgb_to_nv12_ultra((const uint32_t *)shm_data, width, height, width,
-                          sw_frame->data[0], sw_frame->linesize[0],
-                          sw_frame->data[1], sw_frame->linesize[1]);
+        color_convert_xrgb_to_nv12_bt709((const uint32_t *)shm_data, width, height, width,
+                                         sw_frame->data[0], sw_frame->linesize[0],
+                                         sw_frame->data[1], sw_frame->linesize[1]);
         clock_gettime(CLOCK_MONOTONIC, &t2);
 
         // Send frame (Upload + VDENC submit)
@@ -373,7 +303,16 @@ int main(int argc, char **argv) {
         VASurfaceID dst_surf = VA_INVALID_ID;
         video_enc_get_hw_surface(&enc, &dst_surf);
         VAProcPipelineParameterBuffer param = {
-            .surface = dmabuf_bufs[cur_db].va_surf, .surface_region = &rect, .output_region = &rect
+            .surface = dmabuf_bufs[cur_db].va_surf,
+            .surface_region = &rect,
+            .output_region = &rect,
+            .surface_color_standard = VAProcColorStandardSRGB,
+            .input_color_properties.colour_primaries = 1,
+            .input_color_properties.transfer_characteristics = 13,
+            .input_color_properties.matrix_coefficients = 0,
+            .input_color_properties.color_range = VA_SOURCE_RANGE_FULL,
+            .output_color_standard = VAProcColorStandardBT709,
+            .output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED
         };
         VABufferID pipe_buf;
         vaCreateBuffer(va_dpy, vpp_ctx, VAProcPipelineParameterBufferType, sizeof(param), 1, &param, &pipe_buf);

@@ -24,7 +24,7 @@
 #define BENCH_TX_PORT           19004
 #define BENCH_RX_PORT           19002
 
-#define GOP_SIZE                15           /* Micro-GOP: 1 IDR every 15 frames */
+#define GOP_SIZE                30           /* One IDR every 500 ms at 60 FPS */
 #define IDR_PACKETS             64           /* ~85 KB keyframe */
 #define P_PACKETS               26           /* ~34.5 KB delta frame */
 #define MAX_TOTAL_PACKETS       (BENCH_FRAMES * IDR_PACKETS)
@@ -176,6 +176,67 @@ static void build_rtp_packet(uint8_t *pkt_buf, uint16_t seq, uint32_t rtp_pts) {
     }
 }
 
+static int check_dispatch_timestamp(void) {
+    rx_context_t rx_ctx;
+    if (start_receiver(&rx_ctx, BENCH_RX_PORT) != 0) return 1;
+
+    net_pacer_cfg_t cfg = {
+        .local_ip = BENCH_LOCAL_IP,
+        .local_port = 0,
+        .dest_ip = BENCH_LOCAL_IP,
+        .dest_port = BENCH_RX_PORT,
+        .pacing_budget_ns = 3000000ULL,
+        .enable_pacing = true,
+    };
+    net_pacer_t pacer;
+    if (net_pacer_init(&pacer, &cfg) != 0) {
+        stop_receiver(&rx_ctx);
+        return 1;
+    }
+
+    uint8_t packet[NET_PACER_RTP_PACKET_SIZE] = {0};
+    net_pacer_telemetry_t telemetry[4];
+    net_pacer_frame_begin(&pacer);
+    for (int i = 0; i < 4; i++) {
+        if (net_pacer_queue_packet(&pacer, packet, sizeof(packet)) != 0) {
+            net_pacer_close(&pacer);
+            stop_receiver(&rx_ctx);
+            return 1;
+        }
+    }
+
+    usleep(20000);
+    struct timespec before_ts, after_ts;
+    clock_gettime(CLOCK_MONOTONIC, &before_ts);
+    int sent = net_pacer_send_frame_measured(&pacer, telemetry, 4);
+    clock_gettime(CLOCK_MONOTONIC, &after_ts);
+    uint64_t before_ns = (uint64_t)before_ts.tv_sec * 1000000000ULL + before_ts.tv_nsec;
+    uint64_t after_ns = (uint64_t)after_ts.tv_sec * 1000000000ULL + after_ts.tv_nsec;
+
+    int failed = sent != 4 || telemetry[0].target_ns < before_ns || telemetry[0].target_ns > after_ns;
+    for (int i = 1; i < 4; i++) {
+        if (telemetry[i].target_ns - telemetry[i - 1].target_ns != cfg.pacing_budget_ns / 4) {
+            failed = 1;
+        }
+    }
+    net_pacer_close(&pacer);
+    stop_receiver(&rx_ctx);
+
+    if (failed) {
+        fprintf(stderr,
+                "Dispatch timestamp regression check failed: sent=%d, before=%lu, first_target=%lu, after=%lu\n",
+                sent, (unsigned long)before_ns, (unsigned long)telemetry[0].target_ns,
+                (unsigned long)after_ns);
+        for (int i = 1; i < 4; i++) {
+            fprintf(stderr, "  target delta %d: %lu ns\n", i,
+                    (unsigned long)(telemetry[i].target_ns - telemetry[i - 1].target_ns));
+        }
+        return 1;
+    }
+    printf("Dispatch timestamp regression check passed after a 20 ms encode delay\n");
+    return 0;
+}
+
 /* Results for one benchmark run (Burst or Paced) */
 typedef struct {
     const char *mode_name;
@@ -243,17 +304,12 @@ static int run_simulation(bool enable_pacing, const char *mode_name, bench_resul
     printf("\n[Benchmark] Executing %d frames under %s...\n", BENCH_FRAMES, mode_name);
 
     for (uint32_t f = 0; f < BENCH_FRAMES; f++) {
-        // Compute 60 Hz frame slot target time
-        uint64_t frame_slot_start_ns = bench_start_ns + (uint64_t)f * FRAME_INTERVAL_NS;
-
-        // Micro-GOP structure: frame 0, 15, 30... are IDR keyframes (64 pkts), others are P-frames (26 pkts)
+        // GOP 30 structure: frame 0, 30, 60... are IDR keyframes
         bool is_idr = (f % GOP_SIZE == 0);
         uint32_t frame_pkts = is_idr ? IDR_PACKETS : P_PACKETS;
 
         // 1. Accumulate frame packets in net_pacer
         net_pacer_frame_begin(&pacer);
-        pacer.frame_start_ts.tv_sec  = (time_t)(frame_slot_start_ns / 1000000000ULL);
-        pacer.frame_start_ts.tv_nsec = (long)(frame_slot_start_ns % 1000000000ULL);
         for (uint32_t p = 0; p < frame_pkts; p++) {
             build_rtp_packet(packet_buffer, seq_num++, rtp_pts);
             net_pacer_queue_packet(&pacer, packet_buffer, sizeof(packet_buffer));
@@ -342,7 +398,7 @@ static void print_comparison(const bench_result_t *burst, const bench_result_t *
     printf("\n");
     printf("==================================================================================================\n");
     printf(" FLUXCAST-C LOW-LATENCY NETWORK TRANSPORT & MICROSECOND PACING BENCHMARK REPORT\n");
-    printf(" 300 Video Frames @ 60 FPS (1080p Miracast H.264 Profile, Micro-GOP 15)\n");
+    printf(" 300 Video Frames @ 60 FPS (1080p Miracast H.264 High Profile, GOP 30)\n");
     printf("==================================================================================================\n\n");
 
     printf("%-38s | %-26s | %-26s\n", "Pipeline Metric", "Unpaced (Burst Mode)", "Microsecond-Paced Mode");
@@ -403,6 +459,8 @@ static void print_comparison(const bench_result_t *burst, const bench_result_t *
 }
 
 int main(void) {
+    if (check_dispatch_timestamp() != 0) return 1;
+
     printf("[FluxCast-C Network Transport Benchmark]\n");
     printf("Validating Wi-Fi Multimedia (WMM) Voice (AC_VO), DSCP CS6, and Microsecond Pacing Pipeline...\n");
 

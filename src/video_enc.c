@@ -110,10 +110,14 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
     c->height       = enc->config.height;
     c->time_base    = (AVRational){1, 90000};
     c->framerate    = (AVRational){enc->config.fps, 1};
-    c->pix_fmt      = AV_PIX_FMT_VAAPI;
-    c->gop_size     = enc->config.gop_size;
-    c->max_b_frames = 0;
-    c->has_b_frames = 0;
+    c->pix_fmt         = AV_PIX_FMT_VAAPI;
+    c->gop_size        = enc->config.gop_size;
+    c->max_b_frames    = 0;
+    c->has_b_frames    = 0;
+    c->colorspace      = AVCOL_SPC_BT709;
+    c->color_primaries = AVCOL_PRI_BT709;
+    c->color_trc       = AVCOL_TRC_BT709;
+    c->color_range     = AVCOL_RANGE_MPEG;
 
     /* Enforce single slice: prevents +87.4% bitrate bloat from driver row rounding */
     c->slices = enc->config.slices;
@@ -193,9 +197,13 @@ AVFrame *video_enc_alloc_sw_frame(const VideoEncoder *enc) {
     AVFrame *frame = av_frame_alloc();
     if (!frame) return NULL;
 
-    frame->format = AV_PIX_FMT_NV12;
-    frame->width  = enc->config.width;
-    frame->height = enc->config.height;
+    frame->format          = AV_PIX_FMT_NV12;
+    frame->width           = enc->config.width;
+    frame->height          = enc->config.height;
+    frame->colorspace      = AVCOL_SPC_BT709;
+    frame->color_primaries = AVCOL_PRI_BT709;
+    frame->color_trc       = AVCOL_TRC_BT709;
+    frame->color_range     = AVCOL_RANGE_MPEG;
 
     int err = av_frame_get_buffer(frame, 32);
     if (err < 0) {

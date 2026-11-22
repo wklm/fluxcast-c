@@ -316,6 +316,13 @@ int dmabuf_capture_convert_vpp(DmaBufCapture *cap, VASurfaceID dst_surface) {
     vpp_param.surface = buf->va_surface;
     vpp_param.surface_region = &cap->vpp_rect;
     vpp_param.output_region = &cap->vpp_rect;
+    vpp_param.surface_color_standard = VAProcColorStandardSRGB;
+    vpp_param.input_color_properties.colour_primaries = 1;
+    vpp_param.input_color_properties.transfer_characteristics = 13;
+    vpp_param.input_color_properties.matrix_coefficients = 0;
+    vpp_param.input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
+    vpp_param.output_color_standard = VAProcColorStandardBT709;
+    vpp_param.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
 
     VABufferID pipe_buf = VA_INVALID_ID;
     VAStatus st = vaCreateBuffer(cap->va_dpy, cap->vpp_ctx, VAProcPipelineParameterBufferType,

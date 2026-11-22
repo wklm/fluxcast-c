@@ -196,7 +196,6 @@ int net_pacer_set_destination(net_pacer_t *pacer, const char *dest_ip, uint16_t 
 int net_pacer_frame_begin(net_pacer_t *pacer) {
     if (!pacer) return -EINVAL;
     pacer->num_packets = 0;
-    clock_gettime(CLOCK_MONOTONIC, &pacer->frame_start_ts);
     return 0;
 }
 
@@ -223,19 +222,12 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
     uint32_t n = pacer->num_packets;
     if (n == 0) return 0;
 
-    // Frame transmission start reference timestamp
     struct timespec ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_now);
-
-    uint64_t t_start_ns;
-    if (pacer->frame_start_ts.tv_sec != 0) {
-        t_start_ns = (uint64_t)pacer->frame_start_ts.tv_sec * 1000000000ULL + pacer->frame_start_ts.tv_nsec;
-    } else {
-        t_start_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + ts_now.tv_nsec;
-    }
+    uint64_t t_start_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL + ts_now.tv_nsec;
 
     uint64_t budget_ns = pacer->cfg.pacing_budget_ns ? pacer->cfg.pacing_budget_ns : NET_PACER_DEFAULT_PACING_BUDGET_NS;
-    // Delta t pacing interval = 13.333333 ms / N_packets
+    // Spread packet departures evenly across the current frame's budget.
     uint64_t delta_ns = (n > 1) ? (budget_ns / n) : budget_ns;
 
     int sent_count = 0;
@@ -299,9 +291,7 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
     uint64_t finish_ns = (uint64_t)ts_finish.tv_sec * 1000000000ULL + ts_finish.tv_nsec;
     pacer->stats.last_frame_total_duration_ns = finish_ns - t_start_ns;
 
-    // Reset frame accumulation state
     pacer->num_packets = 0;
-    pacer->frame_start_ts = (struct timespec){0, 0};
 
     return sent_count;
 }

@@ -19,7 +19,6 @@
 #include <pthread.h>
 #include <time.h>
 #include <poll.h>
-#include <immintrin.h>
 
 #include <wayland-client.h>
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
@@ -28,6 +27,7 @@
 #include "realtime_sys.h"
 #include "video_enc.h"
 #include "net_pacer.h"
+#include "color_convert.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -100,78 +100,6 @@ struct wayland_context {
 
 static struct wayland_context g_wl;
 
-// Ultra-fast AVX2 SIMD XRGB8888 -> NV12 converter (Rec.601)
-// Processes 8 pixels per vector chunk with zero thread contention (~4.0 ms per frame)
-static inline void xrgb_to_nv12_ultra(const uint32_t *src, int w, int h, int stride_pixels,
-                                      uint8_t *y_plane, int y_stride,
-                                      uint8_t *uv_plane, int uv_stride) {
-    const __m256i mask_b = _mm256_set1_epi32(0x000000ff);
-    const __m256i mask_g = _mm256_set1_epi32(0x0000ff00);
-    const __m256i mask_r = _mm256_set1_epi32(0x00ff0000);
-
-    const __m256i coeff_yr = _mm256_set1_epi32(66);
-    const __m256i coeff_yg = _mm256_set1_epi32(129);
-    const __m256i coeff_yb = _mm256_set1_epi32(25);
-    const __m256i bias_y   = _mm256_set1_epi32(128 + (16 << 8));
-
-    for (int y = 0; y < h; y += 2) {
-        const uint32_t *r0 = src + y * stride_pixels;
-        const uint32_t *r1 = src + (y + 1) * stride_pixels;
-        uint8_t *y0 = y_plane + y * y_stride;
-        uint8_t *y1 = y_plane + (y + 1) * y_stride;
-        uint8_t *uv = uv_plane + (y / 2) * uv_stride;
-
-        for (int x = 0; x < w; x += 8) {
-            __m256i p0 = _mm256_loadu_si256((const __m256i *)(r0 + x));
-            __m256i p1 = _mm256_loadu_si256((const __m256i *)(r1 + x));
-
-            __m256i b0 = _mm256_and_si256(p0, mask_b);
-            __m256i g0 = _mm256_srli_epi32(_mm256_and_si256(p0, mask_g), 8);
-            __m256i r0_c = _mm256_srli_epi32(_mm256_and_si256(p0, mask_r), 16);
-
-            __m256i y0_val = _mm256_srli_epi32(_mm256_add_epi32(
-                _mm256_add_epi32(_mm256_mullo_epi32(r0_c, coeff_yr), _mm256_mullo_epi32(g0, coeff_yg)),
-                _mm256_add_epi32(_mm256_mullo_epi32(b0, coeff_yb), bias_y)
-            ), 8);
-
-            __m256i b1 = _mm256_and_si256(p1, mask_b);
-            __m256i g1 = _mm256_srli_epi32(_mm256_and_si256(p1, mask_g), 8);
-            __m256i r1_c = _mm256_srli_epi32(_mm256_and_si256(p1, mask_r), 16);
-
-            __m256i y1_val = _mm256_srli_epi32(_mm256_add_epi32(
-                _mm256_add_epi32(_mm256_mullo_epi32(r1_c, coeff_yr), _mm256_mullo_epi32(g1, coeff_yg)),
-                _mm256_add_epi32(_mm256_mullo_epi32(b1, coeff_yb), bias_y)
-            ), 8);
-
-            // Pack Y (8 x 32-bit -> 8 x 16-bit -> 8 x 8-bit)
-            __m128i y0_lo = _mm256_castsi256_si128(y0_val);
-            __m128i y0_hi = _mm256_extracti128_si256(y0_val, 1);
-            __m128i y0_16 = _mm_packus_epi32(y0_lo, y0_hi);
-            __m128i y0_8  = _mm_packus_epi16(y0_16, y0_16);
-            _mm_storel_epi64((__m128i *)(y0 + x), y0_8);
-
-            __m128i y1_lo = _mm256_castsi256_si128(y1_val);
-            __m128i y1_hi = _mm256_extracti128_si256(y1_val, 1);
-            __m128i y1_16 = _mm_packus_epi32(y1_lo, y1_hi);
-            __m128i y1_8  = _mm_packus_epi16(y1_16, y1_16);
-            _mm_storel_epi64((__m128i *)(y1 + x), y1_8);
-
-            // UV: Average 2x2 blocks
-            __m256i r_avg = _mm256_srli_epi32(_mm256_add_epi32(r0_c, r1_c), 1);
-            __m256i g_avg = _mm256_srli_epi32(_mm256_add_epi32(g0, g1), 1);
-            __m256i b_avg = _mm256_srli_epi32(_mm256_add_epi32(b0, b1), 1);
-
-            for (int k = 0; k < 8; k += 2) {
-                int r_2x2 = (_mm256_extract_epi32(r_avg, k) + _mm256_extract_epi32(r_avg, k + 1)) >> 1;
-                int g_2x2 = (_mm256_extract_epi32(g_avg, k) + _mm256_extract_epi32(g_avg, k + 1)) >> 1;
-                int b_2x2 = (_mm256_extract_epi32(b_avg, k) + _mm256_extract_epi32(b_avg, k + 1)) >> 1;
-
-                uv[x + k]     = (uint8_t)(((-38 * r_2x2 -  74 * g_2x2 + 112 * b_2x2 + 128) >> 8) + 128);
-                uv[x + k + 1] = (uint8_t)((( 112 * r_2x2 -  94 * g_2x2 -  18 * b_2x2 + 128) >> 8) + 128);
-            }
-        }
-    }
-}
 
 // Screencopy Callbacks with dynamic dimension/stride recreation and leak-free memfd handling
 static void shm_handle_format(void *data, struct wl_shm *shm, uint32_t format) {}
@@ -848,14 +776,14 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            // Ultra-low latency AVX2 conversion from Wayland SHM buffer to NV12 sw_frame
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~7) : WIDTH;
+            int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~1) : WIDTH;
             int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
             int stride_pixels = g_wl.stride / 4;
-            xrgb_to_nv12_ultra((const uint32_t *)g_wl.bufs[g_wl.cur_buf].data, conv_w, conv_h, stride_pixels,
-                              sw_frame->data[0], sw_frame->linesize[0],
-                              sw_frame->data[1], sw_frame->linesize[1]);
+            color_convert_xrgb_to_nv12_bt709((const uint32_t *)g_wl.bufs[g_wl.cur_buf].data,
+                                             conv_w, conv_h, stride_pixels,
+                                             sw_frame->data[0], sw_frame->linesize[0],
+                                             sw_frame->data[1], sw_frame->linesize[1]);
 
             g_wl.cur_buf ^= 1;
             clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
