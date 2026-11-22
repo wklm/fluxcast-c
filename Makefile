@@ -3,7 +3,7 @@ CFLAGS ?= -O3 -march=native -fopenmp -fomit-frame-pointer -flto -Wall -Wextra -W
 PKG_CFLAGS := $(shell pkg-config --cflags libavcodec libavformat libavutil wayland-client)
 PKG_LIBS   := $(shell pkg-config --libs libavcodec libavformat libavutil wayland-client) -lpthread -lm
 
-SRC = src/wfd_fast.c src/realtime_sys.c src/net_pacer.c src/wlr-screencopy-unstable-v1-protocol.c
+SRC = src/wfd_fast.c src/realtime_sys.c src/video_enc.c src/net_pacer.c src/wlr-screencopy-unstable-v1-protocol.c
 BIN = bin/wfd-fast
 BENCH_BIN = bin/bench_video_enc
 BENCH_KERNEL = bin/bench_kernel_sys

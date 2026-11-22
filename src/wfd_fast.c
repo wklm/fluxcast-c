@@ -24,12 +24,26 @@
 #include <wayland-client.h>
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "realtime_sys.h"
+#include "video_enc.h"
+#include "net_pacer.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+
+static net_pacer_t g_pacer;
+
+static int pacer_avio_write_cb(void *opaque, const uint8_t *buf, int size) {
+    net_pacer_t *pacer = (net_pacer_t *)opaque;
+    if (size <= 0) return 0;
+    // Miracast RTP packets are standard 1328 bytes (12B RTP header + 7 * 188B TS packets) with PT=33
+    if (size == NET_PACER_RTP_PACKET_SIZE || (size > 12 && (buf[1] & 0x7F) == 33)) {
+        net_pacer_queue_packet(pacer, buf, size);
+    }
+    return size;
+}
 
 #define WFD_RTSP_PORT 7236
 #define DEFAULT_FPS 60
@@ -505,12 +519,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    AVBufferRef *hw_device_ctx = NULL;
-    AVBufferRef *hw_frames_ref = NULL;
+    VideoEncoder venc;
+    bool venc_initialized = false;
     AVCodecContext *enc = NULL;
     AVFormatContext *out_ctx = NULL;
     AVFrame *sw_frame = NULL;
-    AVFrame *hw_frame = NULL;
     AVPacket *pkt = NULL;
     int timer_fd = -1;
 
@@ -554,61 +567,59 @@ int main(int argc, char **argv) {
         goto teardown;
     }
 
-    // 3. Initialize VA-API Hardware Device Context
-    int err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0);
+    // 3. Initialize VA-API Hardware H.264 Encoder (Intel VDENC ASIC)
+    VideoEncConfig enc_cfg;
+    video_enc_config_default(&enc_cfg);
+    enc_cfg.width = WIDTH;
+    enc_cfg.height = HEIGHT;
+    enc_cfg.fps = DEFAULT_FPS;
+    enc_cfg.qp = 28;
+    enc_cfg.gop_size = 15;
+    enc_cfg.slices = 1;
+    enc_cfg.quality = 7;
+    enc_cfg.async_depth = 1;
+    enc_cfg.device_path = "/dev/dri/renderD128";
+
+    int err = video_enc_init(&venc, &enc_cfg);
     if (err < 0) {
-        fprintf(stderr, "Error: Failed to open VA-API device /dev/dri/renderD128\n");
+        fprintf(stderr, "Error: Failed to initialize video encoder (%d)\n", err);
         return 1;
     }
-
-    // 4. Initialize Hardware H.264 Encoder
-    const AVCodec *codec = avcodec_find_encoder_by_name("h264_vaapi");
-    enc = avcodec_alloc_context3(codec);
-    enc->width = WIDTH;
-    enc->height = HEIGHT;
-    enc->time_base = (AVRational){1, 90000};
-    enc->framerate = (AVRational){DEFAULT_FPS, 1};
-    enc->pix_fmt = AV_PIX_FMT_VAAPI;
-    enc->gop_size = 15;
-    enc->max_b_frames = 0;
-    enc->has_b_frames = 0;
-    enc->slices = 1; // Strict 1 slice: prevents Intel VDENC driver bloat
-    enc->flags |= AV_CODEC_FLAG_LOW_DELAY; // Forces DPB max_dec_frame_buffering=1 (bypasses 33-50ms TV reordering delay)
-    enc->flags2 |= AV_CODEC_FLAG2_FAST;
-
-    hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
-    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
-    frames_ctx->format = AV_PIX_FMT_VAAPI;
-    frames_ctx->sw_format = AV_PIX_FMT_NV12;
-    frames_ctx->width = WIDTH;
-    frames_ctx->height = HEIGHT;
-    frames_ctx->initial_pool_size = 4;
-    av_hwframe_ctx_init(hw_frames_ref);
-    enc->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
-
-    // Ultra-low latency options
-    av_opt_set(enc->priv_data, "low_power", "1", 0);
-    av_opt_set(enc->priv_data, "profile", "578", 0);
-    av_opt_set(enc->priv_data, "coder", "cavlc", 0);
-    av_opt_set(enc->priv_data, "quality", "7", 0);
-    av_opt_set(enc->priv_data, "rc_mode", "CQP", 0);
-    av_opt_set(enc->priv_data, "qp", "28", 0);
-    av_opt_set(enc->priv_data, "sei", "recovery_point", 0);
-    av_opt_set(enc->priv_data, "async_depth", "1", 0);
-
-    err = avcodec_open2(enc, codec, NULL);
-    if (err < 0) {
-        fprintf(stderr, "Error: Failed to open h264_vaapi encoder (%d)\n", err);
-        return 1;
-    }
+    venc_initialized = true;
+    enc = venc.codec_ctx;
     printf("[FluxCast-C Encoder] Intel QuickSync VDENC ASIC engaged at %dx%d@%d!\n", WIDTH, HEIGHT, DEFAULT_FPS);
 
-    // 5. Initialize Zero-Delay RTP MPEG-TS Output
+    // 4. Initialize Network Pacer & WMM Voice QoS
+    net_pacer_cfg_t pacer_cfg = {
+        .local_ip = g_local_ip,
+        .local_port = g_local_rtp_port,
+        .dest_ip = g_tv_ip,
+        .dest_port = g_tv_rtp_port,
+        .pacing_budget_ns = NET_PACER_DEFAULT_PACING_BUDGET_NS,
+        .enable_pacing = true,
+    };
+    if (net_pacer_init(&g_pacer, &pacer_cfg) < 0) {
+        fprintf(stderr, "Error: Failed to initialize net_pacer\n");
+        return 1;
+    }
+
+    // 5. Initialize Zero-Delay RTP MPEG-TS Output with Custom AVIO
     char rtp_url[256];
     snprintf(rtp_url, sizeof(rtp_url), "rtp://%s:%d", g_tv_ip, g_tv_rtp_port);
     printf("[FluxCast-C Network] Output target: %s (Source %s:%d)\n", rtp_url, g_local_ip, g_local_rtp_port);
 
     avformat_alloc_output_context2(&out_ctx, NULL, "rtp_mpegts", rtp_url);
+    if (!out_ctx) {
+        fprintf(stderr, "Error: Failed to allocate output context\n");
+        return 1;
+    }
+
+    size_t avio_buf_size = 2048;
+    unsigned char *avio_buf = av_malloc(avio_buf_size);
+    AVIOContext *avio = avio_alloc_context(avio_buf, avio_buf_size, 1, &g_pacer, NULL, pacer_avio_write_cb, NULL);
+    avio->max_packet_size = 1328;
+    out_ctx->pb = avio;
+
     AVStream *st = avformat_new_stream(out_ctx, NULL);
     st->id = 4113;
     st->time_base = (AVRational){1, 90000};
@@ -625,39 +636,10 @@ int main(int argc, char **argv) {
     av_opt_set_int(out_ctx->priv_data, "mpegts_pmt_start_pid", 4096, 0);
     av_opt_set_int(out_ctx->priv_data, "mpegts_start_pid", 4113, 0);
 
-    AVDictionary *io_opts = NULL;
-    av_dict_set(&io_opts, "localaddr", g_local_ip, 0);
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", g_local_rtp_port);
-    av_dict_set(&io_opts, "local_rtpport", port_str, 0);
-    snprintf(port_str, sizeof(port_str), "%d", g_local_rtp_port + 1);
-    av_dict_set(&io_opts, "local_rtcpport", port_str, 0);
-    av_dict_set(&io_opts, "pkt_size", "1328", 0);
-    av_dict_set(&io_opts, "buffer_size", "1048576", 0);
-
-    err = avio_open2(&out_ctx->pb, out_ctx->url, AVIO_FLAG_WRITE, NULL, &io_opts);
-    av_dict_free(&io_opts);
-    if (err < 0) {
-        fprintf(stderr, "Error: Could not open RTP UDP output (%d)\n", err);
-        return 1;
-    }
-
-    // Apply Wi-Fi Multimedia (WMM) AC_VO (Voice/Ultra-low latency) QoS to RTP & RTCP sockets
-    for (int sfd = 3; sfd < 128; sfd++) {
-        struct sockaddr_in sin;
-        socklen_t slen = sizeof(sin);
-        if (getsockname(sfd, (struct sockaddr *)&sin, &slen) == 0) {
-            if (sin.sin_family == AF_INET &&
-                (ntohs(sin.sin_port) == g_local_rtp_port || ntohs(sin.sin_port) == g_local_rtp_port + 1)) {
-                int prio = 6; // Voice / Highest Priority Access Category (AC_VO)
-                setsockopt(sfd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
-                int tos = 0xb8; // DSCP Expedited Forwarding (EF)
-                setsockopt(sfd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
-                printf("[FluxCast-C Network] Socket fd %d on port %d: Applied SO_PRIORITY=6 (WMM AC_VO), IP_TOS=0xb8 (DSCP EF)\n",
-                       sfd, ntohs(sin.sin_port));
-            }
-        }
-    }
+    AVDictionary *rtp_opts = NULL;
+    av_dict_set(&rtp_opts, "rtpflags", "skip_rtcp", 0);
+    av_opt_set_dict_val(out_ctx->priv_data, "rtp_muxer_options", rtp_opts, 0);
+    av_dict_free(&rtp_opts);
 
     if (avformat_write_header(out_ctx, NULL) < 0) {
         fprintf(stderr, "Error: Failed to write RTP MPEG-TS header\n");
@@ -665,13 +647,7 @@ int main(int argc, char **argv) {
     }
 
     // 6. Allocate Frame Buffers
-    sw_frame = av_frame_alloc();
-    sw_frame->format = AV_PIX_FMT_NV12;
-    sw_frame->width = WIDTH;
-    sw_frame->height = HEIGHT;
-    av_frame_get_buffer(sw_frame, 32);
-
-    hw_frame = av_frame_alloc();
+    sw_frame = video_enc_alloc_sw_frame(&venc);
     pkt = av_packet_alloc();
 
     // 7. 60Hz Precision Timer (16,666,666 ns)
@@ -697,6 +673,7 @@ int main(int argc, char **argv) {
     // 8. Stream Loop
     while (g_running && g_streaming) {
         struct timespec t_stage_start, t_stage_end;
+        struct timespec t_frame_start;
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
 
         uint64_t expirations = 0;
@@ -705,8 +682,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[FluxCast-C Loop] timerfd read error: %s (errno %d)\n", strerror(errno), errno);
             break;
         }
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_pacing_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+        clock_gettime(CLOCK_MONOTONIC, &t_frame_start);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t pts_us = (now.tv_sec - t_stream_start.tv_sec) * 1000000LL + (now.tv_nsec - t_stream_start.tv_nsec) / 1000;
@@ -715,6 +691,8 @@ int main(int argc, char **argv) {
             pts = last_pts + 1;
         }
         last_pts = pts;
+
+        net_pacer_frame_begin(&g_pacer);
 
         g_wl.frame_ready = false;
         g_wl.frame_failed = false;
@@ -760,7 +738,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[FluxCast-C Wayland] Screencopy capture failed (e.g. DPMS / display blanking, count=%u)\n",
                         failed_consecutive);
             }
-            // Drop cycle safely: do not send uninitialized/stale garbage to encoder
             continue;
         }
 
@@ -773,46 +750,22 @@ int main(int argc, char **argv) {
                           sw_frame->data[0], sw_frame->linesize[0],
                           sw_frame->data[1], sw_frame->linesize[1]);
 
-        // Ping-pong SHM buffer index for next capture
         g_wl.cur_buf ^= 1;
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_convert_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
 
-        // Hardware encode
+        // Hardware encode (DMA upload + Intel VDENC ASIC)
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-        err = av_hwframe_get_buffer(enc->hw_frames_ctx, hw_frame, 0);
+        err = video_enc_send_frame(&venc, sw_frame, pts);
         if (err < 0) {
             static int hw_buf_err_cnt = 0;
             if (++hw_buf_err_cnt % 60 == 1) {
-                char errbuf[128];
-                av_strerror(err, errbuf, sizeof(errbuf));
-                fprintf(stderr, "[FluxCast-C Encoder] Hardware surface pool exhausted: %s (%d)\n", errbuf, err);
+                fprintf(stderr, "[FluxCast-C Encoder] video_enc_send_frame failed: %d\n", err);
             }
             continue;
         }
 
-        err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
-        if (err < 0) {
-            char errbuf[128];
-            av_strerror(err, errbuf, sizeof(errbuf));
-            fprintf(stderr, "[FluxCast-C Encoder] Hardware DMA transfer failed: %s (%d)\n", errbuf, err);
-            av_frame_unref(hw_frame);
-            continue;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
-        double t_upload_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
-
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-        hw_frame->pts = pts;
-
-        err = avcodec_send_frame(enc, hw_frame);
-        if (err < 0 && err != AVERROR(EAGAIN)) {
-            char errbuf[128];
-            av_strerror(err, errbuf, sizeof(errbuf));
-            fprintf(stderr, "[FluxCast-C Encoder] avcodec_send_frame failed: %s (%d)\n", errbuf, err);
-        }
-
-        while (avcodec_receive_packet(enc, pkt) == 0) {
+        while (video_enc_receive_packet(&venc, pkt) == 0) {
             pkt->stream_index = 0;
             pkt->pts = pts;
             pkt->dts = pts;
@@ -832,11 +785,31 @@ int main(int argc, char **argv) {
             }
             av_packet_unref(pkt);
         }
-        av_frame_unref(hw_frame);
+        avio_flush(out_ctx->pb);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double t_encode_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
-        double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us;
+        double t_upload_us = (double)venc.last_dma_time_us;
 
+        // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+        double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
+        uint64_t elapsed_ns = (uint64_t)(t_elapsed_frame_us * 1000.0);
+        uint64_t frame_period_ns = 16666667ULL;
+        uint64_t safety_margin_ns = 2000000ULL;
+        uint64_t budget_ns;
+        if (elapsed_ns + safety_margin_ns < frame_period_ns) {
+            budget_ns = frame_period_ns - elapsed_ns - safety_margin_ns;
+        } else {
+            budget_ns = 1000000ULL;
+        }
+        net_pacer_set_budget_ns(&g_pacer, budget_ns);
+
+        // Dispatch frame packets through microsecond pacer
+        net_pacer_send_frame(&g_pacer);
+        clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
+        double t_pacing_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
+
+        double t_total_us = t_capture_us + t_convert_us + t_upload_us + t_encode_us + t_pacing_us;
         telemetry_record_frame(&g_telem, t_capture_us, t_convert_us, t_upload_us, t_encode_us, t_pacing_us, t_total_us);
 
         frame_count++;
@@ -860,16 +833,6 @@ teardown:
         pthread_join(ka_th, NULL);
     }
 
-    // Drain encoder
-    if (enc && out_ctx) {
-        avcodec_send_frame(enc, NULL);
-        while (avcodec_receive_packet(enc, pkt) == 0) {
-            pkt->stream_index = 0;
-            av_write_frame(out_ctx, pkt);
-            av_packet_unref(pkt);
-        }
-    }
-
     if (timer_fd >= 0) {
         close(timer_fd);
         timer_fd = -1;
@@ -878,24 +841,23 @@ teardown:
     if (out_ctx) {
         av_write_trailer(out_ctx);
         if (out_ctx->pb) {
-            avio_closep(&out_ctx->pb);
+            av_freep(&out_ctx->pb->buffer);
+            avio_context_free(&out_ctx->pb);
         }
         avformat_free_context(out_ctx);
         out_ctx = NULL;
     }
 
-    av_frame_free(&sw_frame);
-    av_frame_free(&hw_frame);
-    av_packet_free(&pkt);
+    net_pacer_close(&g_pacer);
 
-    if (enc) {
-        avcodec_free_context(&enc);
+    if (pkt) {
+        av_packet_free(&pkt);
     }
-    if (hw_frames_ref) {
-        av_buffer_unref(&hw_frames_ref);
+    if (sw_frame) {
+        av_frame_free(&sw_frame);
     }
-    if (hw_device_ctx) {
-        av_buffer_unref(&hw_device_ctx);
+    if (venc_initialized) {
+        video_enc_close(&venc);
     }
 
     // Clean up Wayland SHM buffers
