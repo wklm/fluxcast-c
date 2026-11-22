@@ -22,6 +22,8 @@ void video_enc_config_default(VideoEncConfig *config) {
     config->slices      = VIDEO_ENC_DEFAULT_SLICES;
     config->quality     = VIDEO_ENC_DEFAULT_QUALITY;
     config->async_depth = VIDEO_ENC_DEFAULT_ASYNC_DEPTH;
+    config->profile     = VIDEO_ENC_DEFAULT_PROFILE;
+    config->coder       = VIDEO_ENC_DEFAULT_CODER;
     config->device_path = VIDEO_ENC_DEFAULT_DEVICE;
 }
 
@@ -43,6 +45,9 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
     if (enc->config.slices <= 0)      enc->config.slices      = VIDEO_ENC_DEFAULT_SLICES;
     if (enc->config.quality <= 0)     enc->config.quality     = VIDEO_ENC_DEFAULT_QUALITY;
     if (enc->config.async_depth <= 0) enc->config.async_depth = VIDEO_ENC_DEFAULT_ASYNC_DEPTH;
+    if (enc->config.profile <= 0)     enc->config.profile     = VIDEO_ENC_DEFAULT_PROFILE;
+    /* In Constrained Baseline (578), CABAC is forbidden by H.264 standard */
+    if (enc->config.profile == 578)   enc->config.coder       = 0;
     if (!enc->config.device_path)     enc->config.device_path = VIDEO_ENC_DEFAULT_DEVICE;
 
     char errbuf[128];
@@ -127,23 +132,26 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
     char qp_str[16];
     char qual_str[16];
     char async_str[16];
+    char prof_str[16];
     snprintf(qp_str, sizeof(qp_str), "%d", enc->config.qp);
     snprintf(qual_str, sizeof(qual_str), "%d", enc->config.quality);
     snprintf(async_str, sizeof(async_str), "%d", enc->config.async_depth);
+    snprintf(prof_str, sizeof(prof_str), "%d", enc->config.profile);
 
     /* Enforce low_power=1: activates Intel VDENC ASIC directly, bypassing EU shaders */
     av_opt_set(c->priv_data, "low_power", "1", 0);
 
-    /* Enforce Constrained Baseline Profile (CHP): profile=578 */
-    av_opt_set(c->priv_data, "profile", "578", 0);
+    /* Profile: 77 (Main) or 100 (High) or 578 (Constrained Baseline) */
+    av_opt_set(c->priv_data, "profile", prof_str, 0);
 
-    /* Enforce CAVLC entropy coding: cuts TV decode complexity by >60% */
-    av_opt_set(c->priv_data, "coder", "cavlc", 0);
+    /* Entropy coding: cabac or cavlc */
+    const char *coder_str = (enc->config.coder == 1) ? "cabac" : "cavlc";
+    av_opt_set(c->priv_data, "coder", coder_str, 0);
 
-    /* Enforce fastest hardware quality pass: quality=7 */
+    /* Fastest hardware quality pass: quality=7 */
     av_opt_set(c->priv_data, "quality", qual_str, 0);
 
-    /* Enforce zero-delay Constant Quantization Parameter: rc_mode=CQP, qp=26 */
+    /* Enforce zero-delay Constant Quantization Parameter: rc_mode=CQP, qp=22 */
     av_opt_set(c->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(c->priv_data, "qp", qp_str, 0);
 
