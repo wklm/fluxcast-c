@@ -4,25 +4,7 @@ A zero-abstraction, high-frequency, native C streaming engine engineered to reac
 
 ---
 
-## 1. Architectural Latency Budget & Physics
-
-Every video frame traveling from the Linux compositor to the TV's LCD panel passes through 7 distinct hardware stages:
-
-| # | Pipeline Stage | Mechanism | Theoretical Lower Bound | Typical Software State | `wfd-fast` (This Engine) |
-|---|---|---|:---:|:---:|:---:|
-| **1** | **Compositor & Input** | Niri Wayland buffer swap & render commit | **8.3 ms** *(half a 60Hz frame)* | ~16.6 ms | **~8.3 ms** |
-| **2** | **Memory Transfer** | Compositor VRAM $\to$ Encoder | **0.1 ms** *(Zero-copy DMA-BUF)* | ~2.5 ms *(64KB pipe copy)* | **~0.4 ms** *(OpenMP Rec.601 SIMD)* |
-| **3** | **Hardware Video Encode** | Intel HD 620 QuickSync VDENC ASIC | **1.8 ms** *(1080p single-slice H.264)* | ~8.0 ms *(EU shader fallback)* | **~1.8 ms** *(`low_power=1`, CAVLC)* |
-| **4** | **Air Transmission (2m)** | 802.11n PHY layer airtime (17 KB/frame) | **0.5 ms** *(Dedicated clean RF channel)* | **40 – 200 ms** *(MCC Channel hopping)* | **~1.0 ms** *(Single-band 2.4GHz)* |
-| **5** | **TV Hardware Decode** | TV MediaTek / Novatek VPU ASIC | **6.0 ms** *(1080p)* / **2.5 ms** *(720p)* | ~35.0 ms *(CABAC long-GOP)* | **~8.0 ms** *(CAVLC short-GOP)* |
-| **6** | **TV Jitter Buffer** | Receiver packet pacing buffer | **16.6 ms** *(1 frame minimum for MPEG-TS)* | 50 – 100 ms *(Starvation re-buffer)* | **~16.6 ms** |
-| **7** | **TV Display Processing** | MEMC / Motion Smoothing / Noise Reduction | **0.0 ms** *(Bypassed in Game/PC mode)* | **80 – 140 ms** *(Default Picture Mode)* | **0.0 ms** *(Game Mode required)* |
-| **8** | **Panel Scan-out** | 60Hz raster refresh (top-to-bottom scan) | **8.3 ms** *(Average line scan)* | 8.3 ms | **8.3 ms** |
-| | **TOTAL LATENCY** | | **~41.6 ms (~2.5 frames)** | **~240 – 400 ms** | **~44 ms (Real-Time Feel)** |
-
----
-
-## 2. Key Engineering Innovations
+## 1. Key Engineering Innovations
 
 ### A. Zero Clock Drift via Real-Time `CLOCK_MONOTONIC` PTS
 * **The Problem:** Standard pipelines use frame counters (`PTS_n = PTS_{n-1} + 1/60`) or `genpts`. During static desktop moments or slight timing delays, incremental counters drift away from real wall-clock time. The TV's MPEG-TS PCR recovery PLL interprets this as late media and expands its internal jitter buffer, causing latency to grow linearly with session duration.
@@ -46,7 +28,7 @@ Every video frame traveling from the Linux compositor to the TV's LCD panel pass
 
 ---
 
-## 3. System & Network Tuning
+## 2. System & Network Tuning
 
 To achieve the ~41 ms wireless floor, three system-level adjustments are required:
 
@@ -71,7 +53,7 @@ To achieve the ~41 ms wireless floor, three system-level adjustments are require
 
 ---
 
-## 4. Building & Running
+## 3. Building & Running
 
 ### Prerequisites
 * Debian / Ubuntu / Arch with:
@@ -101,7 +83,7 @@ scripts/fluxcast-tv.sh
 
 ---
 
-## 5. Benchmarking & Diagnostics
+## 4. Benchmarking & Diagnostics
 
 Build the diagnostic test suite:
 ```bash
