@@ -72,11 +72,11 @@ static void handle_signal(int sig) {
     g_streaming = 0;
 }
 
-static int64_t stream_next_pts(const struct timespec *stream_start, int64_t *last_pts) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    int64_t pts_us = (now.tv_sec - stream_start->tv_sec) * 1000000LL +
-                     (now.tv_nsec - stream_start->tv_nsec) / 1000;
+static int64_t stream_next_pts_at(const struct timespec *stream_start,
+                                  const struct timespec *now,
+                                  int64_t *last_pts) {
+    int64_t pts_us = (now->tv_sec - stream_start->tv_sec) * 1000000LL +
+                     (now->tv_nsec - stream_start->tv_nsec) / 1000;
     int64_t pts = (pts_us * 90) / 1000;
     if (pts <= *last_pts) pts = *last_pts + 1;
     *last_pts = pts;
@@ -838,10 +838,13 @@ int main(int argc, char **argv) {
     }
     muxer_header_written = true;
 
-    // 6. Allocate Frame Buffers
-    sw_frame = video_enc_alloc_sw_frame(&venc);
+    // 6. Allocate Frame Buffers (sw_frame only needed for SHM fallback pipeline)
+    if (!dmabuf_cap) {
+        sw_frame = video_enc_alloc_sw_frame(&venc);
+        if (!sw_frame) goto error;
+    }
     pkt = av_packet_alloc();
-    if (!sw_frame || !pkt) goto error;
+    if (!pkt) goto error;
 
     // 7. 60Hz Precision Timer (16,666,666 ns)
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
@@ -870,7 +873,6 @@ int main(int argc, char **argv) {
     while (g_running && g_streaming) {
         struct timespec t_stage_start, t_stage_end;
         struct timespec t_frame_start;
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
 
         uint64_t expirations = 0;
         if (read(timer_fd, &expirations, sizeof(expirations)) < 0) {
@@ -879,6 +881,7 @@ int main(int argc, char **argv) {
             break;
         }
         clock_gettime(CLOCK_MONOTONIC, &t_frame_start);
+        t_stage_start = t_frame_start;
 
         int64_t pts = 0;
         net_pacer_frame_begin(&g_pacer);
@@ -889,7 +892,6 @@ int main(int argc, char **argv) {
         size_t roi_count = 0;
 
         if (dmabuf_cap) {
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
             int cap_ret = dmabuf_capture_frame(dmabuf_cap);
             clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
             t_capture_us = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
@@ -902,10 +904,11 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
-            pts = stream_next_pts(&t_stream_start, &last_pts);
+            roi_count = dmabuf_capture_get_rois(dmabuf_cap, rois, VIDEO_ENC_MAX_ROIS);
+            pts = stream_next_pts_at(&t_stream_start, &t_stage_end, &last_pts);
 
             // Hardware VPP color conversion (XRGB -> NV12 in GPU hardware, ~0.24ms)
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            t_stage_start = t_stage_end;
             VASurfaceID dst_surface;
             err = video_enc_get_hw_surface(&venc, &dst_surface);
             if (err < 0) {
@@ -928,8 +931,8 @@ int main(int argc, char **argv) {
             }
 
             // Hardware encode (Intel VDENC ASIC direct submit)
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_hw_surface(&venc, pts);
+            t_stage_start = t_stage_end;
+            err = video_enc_send_hw_surface_with_rois(&venc, pts, rois, roi_count);
             if (err < 0) {
                 static int hw_enc_err_cnt = 0;
                 if (++hw_enc_err_cnt % 60 == 1) {
@@ -943,7 +946,6 @@ int main(int argc, char **argv) {
             g_wl.copy_done = false;
             damage_tracker_reset(&g_wl.damage);
 
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
             struct zwlr_screencopy_frame_v1 *sc_frame =
                 zwlr_screencopy_manager_v1_capture_output(g_wl.screencopy_mgr, 1, g_wl.output);
             if (!sc_frame) {
@@ -991,9 +993,9 @@ int main(int argc, char **argv) {
                 NET_PACER_FRAME_BUDGET_NS / 1000.0) {
                 t_frame_start = t_stage_end;
             }
-            pts = stream_next_pts(&t_stream_start, &last_pts);
+            pts = stream_next_pts_at(&t_stream_start, &t_stage_end, &last_pts);
 
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+            t_stage_start = t_stage_end;
             int conv_w = (g_wl.width < WIDTH) ? (g_wl.width & ~1) : WIDTH;
             int conv_h = (g_wl.height < HEIGHT) ? (g_wl.height & ~1) : HEIGHT;
             int stride_pixels = g_wl.stride / 4;
@@ -1008,8 +1010,8 @@ int main(int argc, char **argv) {
             if (t_convert_us < 0.0) t_convert_us = 0.0;
 
             // Hardware encode (DMA upload + Intel VDENC ASIC)
-            clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_frame(&venc, sw_frame, pts);
+            t_stage_start = t_stage_end;
+            err = video_enc_send_frame_with_rois(&venc, sw_frame, pts, rois, roi_count);
             if (err < 0) {
                 static int hw_buf_err_cnt = 0;
                 if (++hw_buf_err_cnt % 60 == 1) {
@@ -1049,7 +1051,7 @@ int main(int argc, char **argv) {
         double t_encode_us = total_hw_elapsed - t_upload_us;
 
         // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
-        clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
+        t_stage_start = t_stage_end;
         double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
         uint64_t elapsed_ns = (t_elapsed_frame_us > 0.0) ? (uint64_t)(t_elapsed_frame_us * 1000.0) : 0ULL;
         uint64_t frame_period_ns = 16666667ULL;

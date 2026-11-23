@@ -124,16 +124,17 @@ int net_pacer_init(net_pacer_t *pacer, const net_pacer_cfg_t *cfg) {
     inet_ntop(AF_INET, &pacer->local_addr.sin_addr, local_ip_str, sizeof(local_ip_str));
     inet_ntop(AF_INET, &pacer->dest_addr.sin_addr, dest_ip_str, sizeof(dest_ip_str));
 
+    const char *wmm_ac = (read_prio >= 6) ? "AC_VO" : (read_prio >= 4 ? "AC_VI" : (read_prio >= 1 ? "AC_BK" : "AC_BE"));
     printf("[FluxCast-C NetPacer] Initialized RTP UDP socket fd=%d\n"
            "  Local Endpoint:  %s:%d\n"
            "  Dest Endpoint:   %s:%d (%s)\n"
-           "  WMM Voice QoS:   SO_PRIORITY=%d (AC_VO), IP_TOS=0x%02X (DSCP CS6)\n"
+           "  WMM QoS:         SO_PRIORITY=%d (%s), IP_TOS=0x%02X (DSCP CS%d)\n"
            "  Buffer & Budget: SO_SNDBUF=%d, Pacing Budget=%.2f ms (%s)\n",
            pacer->sockfd,
            local_ip_str, ntohs(pacer->local_addr.sin_port),
            dest_ip_str, ntohs(pacer->dest_addr.sin_port),
            pacer->is_connected ? "connected" : "unconnected",
-           read_prio, read_tos,
+           read_prio, wmm_ac, read_tos, (read_tos >> 5) & 0x7,
            read_sndbuf,
            (double)pacer->cfg.pacing_budget_ns / 1000000.0,
            pacer->cfg.enable_pacing ? "Microsecond Pacing Active" : "Unpaced Burst Mode");
@@ -225,52 +226,81 @@ int net_pacer_send_frame_measured(net_pacer_t *pacer,
 
     int sent_count = 0;
 
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t target_ns = t_start_ns + (uint64_t)i * delta_ns;
-
-        if (pacer->cfg.enable_pacing) {
-            struct timespec next_send;
-            next_send.tv_sec  = (time_t)(target_ns / 1000000000ULL);
-            next_send.tv_nsec = (long)(target_ns % 1000000000ULL);
-
-            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_send, NULL) == EINTR) {
-                // Interrupted by signal, retry until next_send
+    if (!pacer->cfg.enable_pacing && !telemetry_out) {
+        struct mmsghdr msgs[NET_PACER_MAX_FRAME_PACKETS];
+        struct iovec iovs[NET_PACER_MAX_FRAME_PACKETS];
+        memset(msgs, 0, n * sizeof(msgs[0]));
+        for (uint32_t i = 0; i < n; i++) {
+            iovs[i].iov_base = pacer->packets[i].data;
+            iovs[i].iov_len  = pacer->packets[i].len;
+            msgs[i].msg_hdr.msg_iov    = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            if (!pacer->is_connected) {
+                msgs[i].msg_hdr.msg_name    = &pacer->dest_addr;
+                msgs[i].msg_hdr.msg_namelen = sizeof(pacer->dest_addr);
             }
         }
-
-        bool collect_telemetry = telemetry_out && (size_t)i < max_telemetry;
-        int q_bytes = 0;
-        if (collect_telemetry && ioctl(pacer->sockfd, SIOCOUTQ, &q_bytes) == 0) {
-            if (q_bytes > pacer->stats.peak_tx_queue_bytes) {
-                pacer->stats.peak_tx_queue_bytes = q_bytes;
+        int ret = sendmmsg(pacer->sockfd, msgs, n, 0);
+        if (ret > 0) {
+            sent_count = ret;
+            pacer->stats.packets_sent += (uint64_t)ret;
+            for (int i = 0; i < ret; i++) {
+                pacer->stats.bytes_sent += msgs[i].msg_len;
             }
-        }
-
-        // Transmit packet
-        ssize_t bytes_sent;
-        if (pacer->is_connected) {
-            bytes_sent = send(pacer->sockfd, pacer->packets[i].data, pacer->packets[i].len, 0);
+            if ((uint32_t)ret < n) {
+                pacer->stats.send_errors += (n - (uint32_t)ret);
+            }
         } else {
-            bytes_sent = sendto(pacer->sockfd, pacer->packets[i].data, pacer->packets[i].len, 0,
-                                (struct sockaddr *)&pacer->dest_addr, sizeof(pacer->dest_addr));
+            pacer->stats.send_errors += n;
         }
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t target_ns = t_start_ns + (uint64_t)i * delta_ns;
 
-        if (bytes_sent >= 0) {
-            sent_count++;
-            pacer->stats.packets_sent++;
-            pacer->stats.bytes_sent += (uint64_t)bytes_sent;
-        } else {
-            pacer->stats.send_errors++;
-        }
+            if (pacer->cfg.enable_pacing && i > 0) {
+                struct timespec next_send;
+                next_send.tv_sec  = (time_t)(target_ns / 1000000000ULL);
+                next_send.tv_nsec = (long)(target_ns % 1000000000ULL);
 
-        if (collect_telemetry) {
-            struct timespec ts_dep;
-            clock_gettime(CLOCK_MONOTONIC, &ts_dep);
-            uint64_t departure_ns = (uint64_t)ts_dep.tv_sec * 1000000000ULL + ts_dep.tv_nsec;
-            telemetry_out[i].target_ns      = target_ns;
-            telemetry_out[i].departure_ns   = departure_ns;
-            telemetry_out[i].jitter_ns      = (int64_t)departure_ns - (int64_t)target_ns;
-            telemetry_out[i].tx_queue_bytes = q_bytes;
+                while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_send, NULL) == EINTR) {
+                    // Interrupted by signal, retry until next_send
+                }
+            }
+
+            bool collect_telemetry = telemetry_out && (size_t)i < max_telemetry;
+            int q_bytes = 0;
+            if (collect_telemetry && ioctl(pacer->sockfd, SIOCOUTQ, &q_bytes) == 0) {
+                if (q_bytes > pacer->stats.peak_tx_queue_bytes) {
+                    pacer->stats.peak_tx_queue_bytes = q_bytes;
+                }
+            }
+
+            // Transmit packet
+            ssize_t bytes_sent;
+            if (pacer->is_connected) {
+                bytes_sent = send(pacer->sockfd, pacer->packets[i].data, pacer->packets[i].len, 0);
+            } else {
+                bytes_sent = sendto(pacer->sockfd, pacer->packets[i].data, pacer->packets[i].len, 0,
+                                    (struct sockaddr *)&pacer->dest_addr, sizeof(pacer->dest_addr));
+            }
+
+            if (bytes_sent >= 0) {
+                sent_count++;
+                pacer->stats.packets_sent++;
+                pacer->stats.bytes_sent += (uint64_t)bytes_sent;
+            } else {
+                pacer->stats.send_errors++;
+            }
+
+            if (collect_telemetry) {
+                struct timespec ts_dep;
+                clock_gettime(CLOCK_MONOTONIC, &ts_dep);
+                uint64_t departure_ns = (uint64_t)ts_dep.tv_sec * 1000000000ULL + ts_dep.tv_nsec;
+                telemetry_out[i].target_ns      = target_ns;
+                telemetry_out[i].departure_ns   = departure_ns;
+                telemetry_out[i].jitter_ns      = (int64_t)departure_ns - (int64_t)target_ns;
+                telemetry_out[i].tx_queue_bytes = q_bytes;
+            }
         }
     }
 

@@ -11,6 +11,12 @@ static inline __m256i channel_16(__m256i p0, __m256i p1, int shift) {
     return _mm256_packus_epi32(c0, c1);
 }
 
+static inline __m256i channel_b_16(__m256i p0, __m256i p1) {
+    const __m256i mask = _mm256_set1_epi32(0xff);
+    return _mm256_packus_epi32(_mm256_and_si256(p0, mask),
+                               _mm256_and_si256(p1, mask));
+}
+
 static inline __m256i luma_16(__m256i r, __m256i g, __m256i b) {
     __m256i rg = _mm256_add_epi16(_mm256_mullo_epi16(r, _mm256_set1_epi16(47)),
                                   _mm256_mullo_epi16(g, _mm256_set1_epi16(157)));
@@ -19,9 +25,10 @@ static inline __m256i luma_16(__m256i r, __m256i g, __m256i b) {
     return _mm256_srli_epi16(y, 8);
 }
 
-static inline __m256i average_2x2_16(__m256i row0, __m256i row1) {
-    __m256i vertical = _mm256_add_epi16(row0, row1);
-    __m256i pairs = _mm256_add_epi16(vertical, _mm256_srli_epi64(vertical, 16));
+static inline __m256i average_2x2_packed_16(__m256i r0a, __m256i r1a, __m256i r0b, __m256i r1b) {
+    __m256i va = _mm256_add_epi16(r0a, r1a);
+    __m256i vb = _mm256_add_epi16(r0b, r1b);
+    __m256i pairs = _mm256_hadd_epi16(va, vb);
     return _mm256_srli_epi16(_mm256_add_epi16(pairs, _mm256_set1_epi16(2)), 2);
 }
 
@@ -33,12 +40,12 @@ static inline __m256i chroma_cb_16(__m256i r, __m256i g, __m256i b) {
     return _mm256_srli_epi16(cb, 8);
 }
 
-static inline __m256i chroma_cr_16(__m256i r, __m256i g, __m256i b) {
+static inline __m256i chroma_cr_16_hi(__m256i r, __m256i g, __m256i b) {
     __m256i rg = _mm256_add_epi16(_mm256_mullo_epi16(r, _mm256_set1_epi16(112)),
                                   _mm256_mullo_epi16(g, _mm256_set1_epi16(-102)));
     __m256i cr = _mm256_add_epi16(rg, _mm256_mullo_epi16(b, _mm256_set1_epi16(-10)));
     cr = _mm256_add_epi16(cr, _mm256_set1_epi16(128 + (128 << 8)));
-    return _mm256_srli_epi16(cr, 8);
+    return _mm256_and_si256(cr, _mm256_set1_epi16((short)0xff00));
 }
 
 static inline void store_32(uint8_t *dst, __m256i value, bool non_temporal) {
@@ -58,9 +65,6 @@ void color_convert_xrgb_to_nv12_bt709(const uint32_t *src, int w, int h, int str
     }
 
     const __m256i restore_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-    const __m256i compact_even_bytes = _mm256_setr_epi8(
-        0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1,
-        0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1);
     const int vector_width = w & ~31;
     const bool non_temporal = (((uintptr_t)y_plane | (uintptr_t)uv_plane |
                                 (uintptr_t)y_stride | (uintptr_t)uv_stride) & 31) == 0;
@@ -87,14 +91,14 @@ void color_convert_xrgb_to_nv12_bt709(const uint32_t *src, int w, int h, int str
             __m256i r0b = channel_16(p02, p03, 16);
             __m256i g0a = channel_16(p00, p01, 8);
             __m256i g0b = channel_16(p02, p03, 8);
-            __m256i b0a = channel_16(p00, p01, 0);
-            __m256i b0b = channel_16(p02, p03, 0);
+            __m256i b0a = channel_b_16(p00, p01);
+            __m256i b0b = channel_b_16(p02, p03);
             __m256i r1a = channel_16(p10, p11, 16);
             __m256i r1b = channel_16(p12, p13, 16);
             __m256i g1a = channel_16(p10, p11, 8);
             __m256i g1b = channel_16(p12, p13, 8);
-            __m256i b1a = channel_16(p10, p11, 0);
-            __m256i b1b = channel_16(p12, p13, 0);
+            __m256i b1a = channel_b_16(p10, p11);
+            __m256i b1b = channel_b_16(p12, p13);
 
             __m256i y0 = _mm256_packus_epi16(luma_16(r0a, g0a, b0a),
                                               luma_16(r0b, g0b, b0b));
@@ -103,21 +107,14 @@ void color_convert_xrgb_to_nv12_bt709(const uint32_t *src, int w, int h, int str
             y0 = _mm256_permutevar8x32_epi32(y0, restore_order);
             y1 = _mm256_permutevar8x32_epi32(y1, restore_order);
 
-            __m256i ra = average_2x2_16(r0a, r1a);
-            __m256i rb = average_2x2_16(r0b, r1b);
-            __m256i ga = average_2x2_16(g0a, g1a);
-            __m256i gb = average_2x2_16(g0b, g1b);
-            __m256i ba = average_2x2_16(b0a, b1a);
-            __m256i bb = average_2x2_16(b0b, b1b);
+            __m256i r_avg = average_2x2_packed_16(r0a, r1a, r0b, r1b);
+            __m256i g_avg = average_2x2_packed_16(g0a, g1a, g0b, g1b);
+            __m256i b_avg = average_2x2_packed_16(b0a, b1a, b0b, b1b);
 
-            __m256i cb = _mm256_packus_epi16(chroma_cb_16(ra, ga, ba),
-                                              chroma_cb_16(rb, gb, bb));
-            __m256i cr = _mm256_packus_epi16(chroma_cr_16(ra, ga, ba),
-                                              chroma_cr_16(rb, gb, bb));
-            cb = _mm256_shuffle_epi8(cb, compact_even_bytes);
-            cr = _mm256_shuffle_epi8(cr, compact_even_bytes);
-            __m256i uv = _mm256_permutevar8x32_epi32(_mm256_unpacklo_epi8(cb, cr),
-                                                   restore_order);
+            __m256i cb = chroma_cb_16(r_avg, g_avg, b_avg);
+            __m256i cr_hi = chroma_cr_16_hi(r_avg, g_avg, b_avg);
+            __m256i uv = _mm256_permutevar8x32_epi32(_mm256_or_si256(cb, cr_hi),
+                                                     restore_order);
 
             store_32(y_out0 + x, y0, non_temporal);
             store_32(y_out1 + x, y1, non_temporal);

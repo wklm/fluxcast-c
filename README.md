@@ -12,7 +12,7 @@ The project is intended for desktop content such as terminals, text editors, and
 - A VA-API device with H.264 encoding support. The current defaults target Intel VDENC.
 - FFmpeg development libraries: `libavcodec`, `libavformat`, and `libavutil`.
 - Development files for Wayland, libdrm, GBM, and VA-API.
-- A C compiler, Make, pkg-config, and OpenMP support.
+- A C compiler, Make, and pkg-config.
 
 The `linux-dmabuf-v1` protocol is optional. FluxCast-C falls back to shared-memory capture when DMA-BUF capture is unavailable or disabled.
 

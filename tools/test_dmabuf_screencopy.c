@@ -22,6 +22,7 @@
 #include <libavutil/hwcontext_vaapi.h>
 
 #include "video_enc.h"
+#include "dmabuf_capture.h"
 #include "color_convert.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
@@ -232,69 +233,24 @@ int main(int argc, char **argv) {
     // BENCHMARK 2: Zero-Copy Pipeline (DMA-BUF Direct Import + Hardware VPP + VDENC)
     // ----------------------------------------------------------------------------------
     printf("\n>>> [2/2] Running Zero-Copy Pipeline: DMA-BUF Import + Hardware VPP + VDENC <<<\n");
-    int drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    struct gbm_device *gbm = gbm_create_device(drm_fd);
-
-    // Double buffer setup
-    struct {
-        struct gbm_bo *bo;
-        int pfd;
-        uint32_t stride;
-        uint64_t mod;
-        struct wl_buffer *wl_buf;
-        VASurfaceID va_surf;
-    } dmabuf_bufs[2];
-
-    for (int k = 0; k < 2; k++) {
-        dmabuf_bufs[k].bo = gbm_bo_create(gbm, width, height, GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-        if (!dmabuf_bufs[k].bo) dmabuf_bufs[k].bo = gbm_bo_create(gbm, width, height, GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING);
-        dmabuf_bufs[k].pfd = gbm_bo_get_fd(dmabuf_bufs[k].bo);
-        dmabuf_bufs[k].stride = gbm_bo_get_stride(dmabuf_bufs[k].bo);
-        dmabuf_bufs[k].mod = gbm_bo_get_modifier(dmabuf_bufs[k].bo);
-
-        struct zwp_linux_buffer_params_v1 *p = zwp_linux_dmabuf_v1_create_params(dmabuf_mgr);
-        zwp_linux_buffer_params_v1_add(p, dmabuf_bufs[k].pfd, 0, 0, dmabuf_bufs[k].stride,
-                                      (uint32_t)(dmabuf_bufs[k].mod >> 32), (uint32_t)(dmabuf_bufs[k].mod & 0xffffffff));
-        dmabuf_bufs[k].wl_buf = zwp_linux_buffer_params_v1_create_immed(p, width, height, DRM_FORMAT_XRGB8888, 0);
-        zwp_linux_buffer_params_v1_destroy(p);
-
-        VADRMPRIMESurfaceDescriptor desc = {
-            .fourcc = VA_FOURCC_BGRX, .width = width, .height = height, .num_objects = 1,
-            .objects = {{.fd = dmabuf_bufs[k].pfd, .size = dmabuf_bufs[k].stride * height, .drm_format_modifier = dmabuf_bufs[k].mod}},
-            .num_layers = 1,
-            .layers = {{.drm_format = DRM_FORMAT_XRGB8888, .num_planes = 1, .object_index = {0}, .offset = {0}, .pitch = {dmabuf_bufs[k].stride}}}
-        };
-        VASurfaceAttrib attr[2] = {
-            {.type = VASurfaceAttribMemoryType, .flags = VA_SURFACE_ATTRIB_SETTABLE, .value = {.type = VAGenericValueTypeInteger, .value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2}},
-            {.type = VASurfaceAttribExternalBufferDescriptor, .flags = VA_SURFACE_ATTRIB_SETTABLE, .value = {.type = VAGenericValueTypePointer, .value.p = &desc}}
-        };
-        vaCreateSurfaces(va_dpy, VA_RT_FORMAT_RGB32, width, height, &dmabuf_bufs[k].va_surf, 1, attr, 2);
-        // PRIME fd has been exported to Wayland and imported to VA-API. Close it immediately.
-        close(dmabuf_bufs[k].pfd);
-        dmabuf_bufs[k].pfd = -1;
-    }
-
-    VAConfigID vpp_cfg;
-    vaCreateConfig(va_dpy, VAProfileNone, VAEntrypointVideoProc, NULL, 0, &vpp_cfg);
-    VAContextID vpp_ctx;
-    vaCreateContext(va_dpy, vpp_cfg, width, height, 0, NULL, 0, &vpp_ctx);
-    VARectangle rect = {0, 0, (uint16_t)width, (uint16_t)height};
-    VABufferID pipe_bufs[2] = { VA_INVALID_ID, VA_INVALID_ID };
-    for (int k = 0; k < 2; k++) {
-        VAProcPipelineParameterBuffer param = {
-            .surface = dmabuf_bufs[k].va_surf,
-            .surface_region = &rect,
-            .output_region = &rect,
-            .surface_color_standard = VAProcColorStandardSRGB,
-            .input_color_properties.colour_primaries = 1,
-            .input_color_properties.transfer_characteristics = 13,
-            .input_color_properties.matrix_coefficients = 0,
-            .input_color_properties.color_range = VA_SOURCE_RANGE_FULL,
-            .output_color_standard = VAProcColorStandardBT709,
-            .output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED
-        };
-        vaCreateBuffer(va_dpy, vpp_ctx, VAProcPipelineParameterBufferType,
-                       sizeof(param), 1, &param, &pipe_bufs[k]);
+    DmaBufCaptureConfig cap_cfg = {
+        .display = display,
+        .screencopy_mgr = screencopy_mgr,
+        .dmabuf_mgr = dmabuf_mgr,
+        .output = output,
+        .va_display = va_dpy,
+        .drm_node = "/dev/dri/renderD128",
+        .width = width,
+        .height = height,
+    };
+    DmaBufCapture *dmabuf_cap = NULL;
+    if (dmabuf_capture_create(&dmabuf_cap, &cap_cfg) < 0) {
+        fprintf(stderr, "Failed to initialize DmaBufCapture\n");
+        free(b_cap); free(b_conv); free(b_upload); free(b_enc); free(b_total);
+        av_packet_free(&pkt);
+        video_enc_close(&enc);
+        wl_display_disconnect(display);
+        return 1;
     }
 
     double *z_cap = malloc(bench_frames * sizeof(double));
@@ -303,26 +259,17 @@ int main(int argc, char **argv) {
     double *z_enc = malloc(bench_frames * sizeof(double));
     double *z_total = malloc(bench_frames * sizeof(double));
 
-    int cur_db = 0;
     for (int i = 0; i < bench_frames; i++) {
         struct timespec t0, t1, t2, t3;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        frame_ready = 0; frame_failed = 0;
-        struct zwlr_screencopy_frame_v1 *f = zwlr_screencopy_manager_v1_capture_output(screencopy_mgr, 1, output);
-        zwlr_screencopy_frame_v1_add_listener(f, &sc_listener, NULL);
-        zwlr_screencopy_frame_v1_copy(f, dmabuf_bufs[cur_db].wl_buf);
-        while (!frame_ready && !frame_failed) wl_display_dispatch(display);
-        zwlr_screencopy_frame_v1_destroy(f);
+        dmabuf_capture_frame(dmabuf_cap);
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
         // Hardware VPP color conversion
         VASurfaceID dst_surf = VA_INVALID_ID;
         video_enc_get_hw_surface(&enc, &dst_surf);
-        VABufferID pipe_buf = pipe_bufs[cur_db];
-        vaBeginPicture(va_dpy, vpp_ctx, dst_surf);
-        vaRenderPicture(va_dpy, vpp_ctx, &pipe_buf, 1);
-        vaEndPicture(va_dpy, vpp_ctx);
+        dmabuf_capture_convert_vpp(dmabuf_cap, dst_surf);
         clock_gettime(CLOCK_MONOTONIC, &t2);
 
         // Direct VDENC ASIC encode
@@ -342,7 +289,6 @@ int main(int argc, char **argv) {
             printf("  [Zero-Copy Frame %02d] Cap: %.2f ms | HW VPP: %.2f ms | Upload: 0.00 ms | HW Enc: %.2f ms | Total: %.2f ms\n",
                    i, z_cap[i]/1000.0, z_conv[i]/1000.0, z_enc[i]/1000.0, z_total[i]/1000.0);
         }
-        cur_db ^= 1;
     }
 
     // ----------------------------------------------------------------------------------
@@ -408,26 +354,14 @@ int main(int argc, char **argv) {
     free(b_cap); free(b_conv); free(b_upload); free(b_enc); free(b_total);
     free(z_cap); free(z_conv); free(z_upload); free(z_enc); free(z_total);
 
-    if (display) {
-        wl_display_roundtrip(display);
-    }
-
-    for (int k = 0; k < 2; k++) {
-        if (pipe_bufs[k] != VA_INVALID_ID) vaDestroyBuffer(va_dpy, pipe_bufs[k]);
-    }
-    vaDestroyContext(va_dpy, vpp_ctx);
-    vaDestroyConfig(va_dpy, vpp_cfg);
-    for (int k = 0; k < 2; k++) {
-        vaDestroySurfaces(va_dpy, &dmabuf_bufs[k].va_surf, 1);
-        wl_buffer_destroy(dmabuf_bufs[k].wl_buf);
-        gbm_bo_destroy(dmabuf_bufs[k].bo);
-        if (dmabuf_bufs[k].pfd >= 0) close(dmabuf_bufs[k].pfd);
-    }
-    gbm_device_destroy(gbm);
-    close(drm_fd);
-
+    dmabuf_capture_destroy(dmabuf_cap);
     av_packet_free(&pkt);
     video_enc_close(&enc);
+    if (screencopy_mgr) zwlr_screencopy_manager_v1_destroy(screencopy_mgr);
+    if (dmabuf_mgr) zwp_linux_dmabuf_v1_destroy(dmabuf_mgr);
+    if (output) wl_output_destroy(output);
+    if (shm) wl_shm_destroy(shm);
+    if (registry) wl_registry_destroy(registry);
     wl_display_disconnect(display);
     return 0;
 }

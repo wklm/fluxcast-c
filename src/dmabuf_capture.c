@@ -54,7 +54,6 @@ struct DmaBufCapture {
 
     VAConfigID vpp_cfg;
     VAContextID vpp_ctx;
-    VARectangle vpp_rect;
     DamageTracker damage;
 };
 
@@ -304,7 +303,6 @@ int dmabuf_capture_create(DmaBufCapture **out_cap, const DmaBufCaptureConfig *cf
         return -EIO;
     }
 
-    cap->vpp_rect = (VARectangle){0, 0, (uint16_t)cap->width, (uint16_t)cap->height};
     for (int i = 0; i < NUM_DMABUF_BUFFERS; i++) {
         VAProcPipelineParameterBuffer param;
         init_vpp_param(cap, cap->bufs[i].va_surface, &param);

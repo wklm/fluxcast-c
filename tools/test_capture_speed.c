@@ -15,7 +15,7 @@ static struct zwlr_screencopy_manager_v1 *screencopy_mgr = NULL;
 static struct wl_output *output = NULL;
 static struct wl_buffer *wl_buf = NULL;
 static void *shm_data = NULL;
-static int shm_fd = -1;
+static size_t shm_size = 0;
 static volatile int ready = 0;
 
 static void registry_handle_global(void *data, struct wl_registry *registry,
@@ -30,13 +30,14 @@ static const struct wl_registry_listener reg_listener = { .global = registry_han
 static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
         uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
     if (!wl_buf) {
-        size_t size = stride * height;
-        shm_fd = memfd_create("test-shm", MFD_CLOEXEC);
-        ftruncate(shm_fd, size);
-        shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-        struct wl_shm_pool *pool = wl_shm_create_pool(shm, shm_fd, size);
+        shm_size = (size_t)stride * height;
+        int shm_fd = memfd_create("test-shm", MFD_CLOEXEC);
+        ftruncate(shm_fd, shm_size);
+        shm_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        struct wl_shm_pool *pool = wl_shm_create_pool(shm, shm_fd, shm_size);
         wl_buf = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
         wl_shm_pool_destroy(pool);
+        close(shm_fd);
     }
     zwlr_screencopy_frame_v1_copy(frame, wl_buf);
 }
@@ -68,6 +69,12 @@ int main() {
     double elapsed = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_nsec - t1.tv_nsec) / 1000000.0;
     printf("30 Wayland full captures in %.2f ms (%.2f ms per frame)!\n", elapsed, elapsed / 30.0);
 
+    if (wl_buf) wl_buffer_destroy(wl_buf);
+    if (shm_data && shm_data != MAP_FAILED) munmap(shm_data, shm_size);
+    if (screencopy_mgr) zwlr_screencopy_manager_v1_destroy(screencopy_mgr);
+    if (output) wl_output_destroy(output);
+    if (shm) wl_shm_destroy(shm);
+    if (r) wl_registry_destroy(r);
     wl_display_disconnect(d);
     return 0;
 }

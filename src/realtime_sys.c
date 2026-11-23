@@ -15,7 +15,10 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
+#include <malloc.h>
 #include <math.h>
+
+#define REALTIME_HEAP_PREFAULT_BYTES (512 * 1024)
 
 static int g_cpu_dma_latency_fd = -1;
 static bool g_mlock_active = false;
@@ -58,6 +61,18 @@ int realtime_sys_init(int target_cpu_core) {
     if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
         g_rt_status.mlock_ok = true;
         g_mlock_active = true;
+        // Prevent glibc from returning heap memory to the OS or using mmap for dynamic allocations
+        mallopt(M_TRIM_THRESHOLD, -1);
+        mallopt(M_MMAP_MAX, 0);
+        uint8_t *heap_pre = (uint8_t *)malloc(REALTIME_HEAP_PREFAULT_BYTES);
+        if (heap_pre) {
+            for (size_t i = 0; i < REALTIME_HEAP_PREFAULT_BYTES; i += 4096) {
+                heap_pre[i] = 0;
+            }
+            heap_pre[REALTIME_HEAP_PREFAULT_BYTES - 1] = 0;
+            __asm__ __volatile__("" : : "r"(heap_pre) : "memory");
+            free(heap_pre);
+        }
         printf("[FluxCast-C Realtime] mlockall(MCL_CURRENT | MCL_FUTURE) active - memory locked\n");
     } else {
         g_rt_status.mlock_ok = false;
@@ -256,23 +271,28 @@ void telemetry_print_summary(const pipeline_telemetry_t *t, const char *prefix) 
     size_t n = (t->count < TELEMETRY_WINDOW_SIZE) ? t->count : TELEMETRY_WINDOW_SIZE;
 
     const char *p = prefix ? prefix : "[FluxCast-C Telemetry]";
-    printf("%s ── Window: %zu frames (Total: %zu frames) ────────────────────────\n",
-           p, n, t->count);
-    printf("%-16s %10s %10s %10s %10s %10s %10s\n",
-           "Stage", "Min (us)", "Mean (us)", "p50 (us)", "p95 (us)", "p99 (us)", "Max (us)");
-    printf("──────────────────────────────────────────────────────────────────────────────────\n");
-
-    #define ROW(name, s) \
-        printf("%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", \
-               name, (s).min, (s).mean, (s).p50, (s).p95, (s).p99, (s).max)
-
-    ROW("t_capture_us", stats.capture);
-    ROW("t_convert_us", stats.convert);
-    ROW("t_upload_us",  stats.upload);
-    ROW("t_encode_us",  stats.encode);
-    ROW("t_pacing_us",  stats.pacing);
-    ROW("t_total_us",   stats.total);
-
-    #undef ROW
-    printf("──────────────────────────────────────────────────────────────────────────────────\n");
+    char buf[1536];
+    int len = snprintf(buf, sizeof(buf),
+        "%s ── Window: %zu frames (Total: %zu frames) ────────────────────────\n"
+        "%-16s %10s %10s %10s %10s %10s %10s\n"
+        "──────────────────────────────────────────────────────────────────────────────────\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "%-16s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n"
+        "──────────────────────────────────────────────────────────────────────────────────\n",
+        p, n, t->count,
+        "Stage", "Min (us)", "Mean (us)", "p50 (us)", "p95 (us)", "p99 (us)", "Max (us)",
+        "t_capture_us", stats.capture.min, stats.capture.mean, stats.capture.p50, stats.capture.p95, stats.capture.p99, stats.capture.max,
+        "t_convert_us", stats.convert.min, stats.convert.mean, stats.convert.p50, stats.convert.p95, stats.convert.p99, stats.convert.max,
+        "t_upload_us",  stats.upload.min,  stats.upload.mean,  stats.upload.p50,  stats.upload.p95,  stats.upload.p99,  stats.upload.max,
+        "t_encode_us",  stats.encode.min,  stats.encode.mean,  stats.encode.p50,  stats.encode.p95,  stats.encode.p99,  stats.encode.max,
+        "t_pacing_us",  stats.pacing.min,  stats.pacing.mean,  stats.pacing.p50,  stats.pacing.p95,  stats.pacing.p99,  stats.pacing.max,
+        "t_total_us",   stats.total.min,   stats.total.mean,   stats.total.p50,   stats.total.p95,   stats.total.p99,   stats.total.max);
+    if (len > 0) {
+        size_t out_len = (size_t)len < sizeof(buf) ? (size_t)len : sizeof(buf) - 1;
+        fwrite(buf, 1, out_len, stdout);
+    }
 }

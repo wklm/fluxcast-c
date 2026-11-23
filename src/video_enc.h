@@ -17,7 +17,7 @@ extern "C" {
  * Fixed-Function VDENC ASIC low-latency streaming pipeline.
  *
  * Sweet spot configuration (Pareto frontier):
- * - QP 22: +3.03 dB PSNR visual improvement at 0% latency regression
+ * - QP 18: crisp text fidelity on 4K Miracast sinks at 0% latency regression
  * - High Profile 100 + CABAC: enables the 8x8 transform for screen content
  * - GOP 30: 500ms keyframe cadence cuts IDR network burst bandwidth in half
  * - Quality 7: strictly preserves 2.6ms VDENC hardware pass
@@ -47,7 +47,7 @@ typedef struct VideoEncConfig {
     int width;              /* Frame width in pixels (default: 1920) */
     int height;             /* Frame height in pixels (default: 1080) */
     int fps;                /* Framerate in FPS (default: 60) */
-    int qp;                 /* Constant QP for CQP mode (default: 22) */
+    int qp;                 /* Constant QP for CQP mode (default: 18) */
     int gop_size;           /* GOP size / keyframe cadence (default: 30) */
     int slices;             /* Slices per frame (default: 1) */
     int quality;            /* Hardware quality level: 1 (best) to 7 (fastest) (default: 7) */
@@ -80,7 +80,7 @@ void video_enc_config_default(VideoEncConfig *config);
 
 /*
  * Initialize VA-API hardware context, NV12 surface pool, and H.264 encoder.
- * Uses High Profile with CABAC, CQP 22, a 30-frame GOP, and BT.709 limited-range
+ * Uses High Profile with CABAC, CQP 18, a 30-frame GOP, and BT.709 limited-range
  * VUI signaling by default.
  *
  * Returns 0 on success, negative AV error code on failure.

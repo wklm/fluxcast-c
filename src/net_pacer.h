@@ -13,15 +13,15 @@ extern "C" {
 #endif
 
 /**
- * 802.11 Wi-Fi Multimedia (WMM) Voice & Microsecond Packet Pacing Configuration
+ * 802.11 Wi-Fi Multimedia (WMM) QoS & Microsecond Packet Pacing Configuration
  *
  * Latency & Contention Specifications:
  * - 60 Hz frame interval = 16.666 ms (16,666,667 ns).
  * - 80% duty cycle transmission budget = 13.333 ms (13,333,333 ns).
  * - Leaves 3.333 ms channel silence before next frame VSYNC.
- * - SO_PRIORITY = 6: Maps to AC_VO (Voice) in mac80211, clamping CW_max=7 and contention to <0.1 ms.
- * - IP_TOS = 0xC0: DSCP CS6 (Class Selector 6 / Network Control / Voice).
- * - SO_SNDBUF = 65536: prevents bufferbloat (clamping buffering to < 25ms).
+ * - SO_PRIORITY = 5: Maps to AC_VI (Video, 3.008 ms TXOP for full A-MPDU aggregation) in mac80211.
+ * - IP_TOS = 0xA0: DSCP CS5 (Class Selector 5 / Video).
+ * - SO_SNDBUF = 262144: fits paced IDR bursts without blocking inside send().
  * - Uses absolute CLOCK_MONOTONIC deadlines and reports departure/queue telemetry.
  */
 
