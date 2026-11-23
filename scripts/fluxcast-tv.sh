@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export PATH="/usr/sbin:/sbin:$PATH"
 # Connect to Hisense Smart TV via Miracast (Ultra-Low Latency 60 FPS VA-API, Video Only)
 
 # 1. Elevate process priority to -15 (real-time video priority)
