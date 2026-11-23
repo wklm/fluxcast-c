@@ -32,7 +32,7 @@ extern "C" {
 
 #define NET_PACER_SO_PRIORITY               6            /* WMM Voice AC_VO */
 #define NET_PACER_IP_TOS                    0xC0         /* DSCP CS6 (Voice / Network Control) */
-#define NET_PACER_SO_SNDBUF                 65536        /* 64 KB requested; prevents bufferbloat (< 25ms) */
+#define NET_PACER_SO_SNDBUF                 262144       /* 256 KB requested; fits paced IDR bursts without blocking */
 
 #define NET_PACER_MAX_PACKET_SIZE           1500         /* Maximum Ethernet/UDP packet MTU */
 #define NET_PACER_MAX_FRAME_PACKETS         1024         /* Up to ~1.4 MB per frame */
