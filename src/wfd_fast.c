@@ -584,6 +584,13 @@ int main(int argc, char **argv) {
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    // Direct background worker and driver threads to Core 1 (CPUs 1, 3)
+    cpu_set_t bg_cpuset;
+    CPU_ZERO(&bg_cpuset);
+    CPU_SET(1, &bg_cpuset);
+    CPU_SET(3, &bg_cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &bg_cpuset);
+
     printf("=========================================================\n");
     printf("  FluxCast-C: Pure C Zero-Abstraction Miracast Streamer \n");
     printf("  Direct Wayland Screencopy -> Intel VDENC Hardware VAAPI\n");
@@ -814,7 +821,7 @@ int main(int argc, char **argv) {
     av_opt_set(out_ctx->priv_data, "max_delay", "0", 0);
     av_opt_set(out_ctx->priv_data, "pes_payload_size", "0", 0);
     av_opt_set(out_ctx->priv_data, "flush_packets", "1", 0);
-    av_opt_set(out_ctx->priv_data, "pcr_period", "20", 0);
+    av_opt_set(out_ctx->priv_data, "pcr_period", "10", 0);
     av_opt_set(out_ctx->priv_data, "pat_period", "0.1", 0);
     av_opt_set(out_ctx->priv_data, "mpegts_flags", "resend_headers+pat_pmt_at_frames", 0);
     av_opt_set_int(out_ctx->priv_data, "mpegts_pmt_start_pid", 4096, 0);

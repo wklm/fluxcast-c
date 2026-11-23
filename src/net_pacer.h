@@ -30,8 +30,8 @@ extern "C" {
 #define NET_PACER_DUTY_CYCLE_PERCENT        80
 #define NET_PACER_DEFAULT_PACING_BUDGET_NS  13333333ULL  /* 13.333 ms (80% of 16.666 ms) */
 
-#define NET_PACER_SO_PRIORITY               6            /* WMM Voice AC_VO */
-#define NET_PACER_IP_TOS                    0xC0         /* DSCP CS6 (Voice / Network Control) */
+#define NET_PACER_SO_PRIORITY               5            /* WMM Video AC_VI (3.008 ms TXOP for full A-MPDU) */
+#define NET_PACER_IP_TOS                    0xA0         /* DSCP CS5 (Video) */
 #define NET_PACER_SO_SNDBUF                 262144       /* 256 KB requested; fits paced IDR bursts without blocking */
 
 #define NET_PACER_MAX_PACKET_SIZE           1500         /* Maximum Ethernet/UDP packet MTU */

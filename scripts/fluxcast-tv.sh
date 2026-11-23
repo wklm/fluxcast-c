@@ -12,6 +12,9 @@ nmcli con delete "Wi-Fi P2P Peer 42:CD:7A:36:FB:F7" 2>/dev/null || true
 
 # 3. Disable Wi-Fi power saving immediately (drops radio latency to 1ms)
 sudo iw dev wlp1s0 set power_save off 2>/dev/null || true
+for dev in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+    sudo iw dev "$dev" set power_save off 2>/dev/null || true
+done
 
 # 4. Target the extended display HDMI-A-1 if present, otherwise eDP-1
 MONITOR="eDP-1"

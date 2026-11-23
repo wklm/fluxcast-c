@@ -104,8 +104,8 @@ static void init_vpp_param(DmaBufCapture *cap, VASurfaceID surface,
                            VAProcPipelineParameterBuffer *param) {
     memset(param, 0, sizeof(*param));
     param->surface = surface;
-    param->surface_region = &cap->vpp_rect;
-    param->output_region = &cap->vpp_rect;
+    param->surface_region = NULL;
+    param->output_region = NULL;
     param->surface_color_standard = VAProcColorStandardSRGB;
     param->input_color_properties.colour_primaries = 1;
     param->input_color_properties.transfer_characteristics = 13;
@@ -113,14 +113,15 @@ static void init_vpp_param(DmaBufCapture *cap, VASurfaceID surface,
     param->input_color_properties.color_range = VA_SOURCE_RANGE_FULL;
     param->output_color_standard = VAProcColorStandardBT709;
     param->output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED;
+    param->filter_flags = VA_FILTER_SCALING_FAST;
 }
 
 static int init_single_buffer(DmaBufCapture *cap, struct dmabuf_buffer *b) {
     b->bo = gbm_bo_create(cap->gbm, cap->width, cap->height, GBM_FORMAT_XRGB8888,
-                          GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+                          GBM_BO_USE_RENDERING);
     if (!b->bo) {
         b->bo = gbm_bo_create(cap->gbm, cap->width, cap->height, GBM_FORMAT_XRGB8888,
-                              GBM_BO_USE_RENDERING);
+                              GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
     }
     if (!b->bo) {
         fprintf(stderr, "[dmabuf_capture] Error: gbm_bo_create failed\n");
