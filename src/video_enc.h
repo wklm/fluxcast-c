@@ -25,7 +25,7 @@ extern "C" {
 #define VIDEO_ENC_DEFAULT_WIDTH       1920
 #define VIDEO_ENC_DEFAULT_HEIGHT      1080
 #define VIDEO_ENC_DEFAULT_FPS         60
-#define VIDEO_ENC_DEFAULT_QP          18
+#define VIDEO_ENC_DEFAULT_QP          22
 #define VIDEO_ENC_DEFAULT_GOP_SIZE    30
 #define VIDEO_ENC_DEFAULT_SLICES      1
 #define VIDEO_ENC_DEFAULT_QUALITY     7
