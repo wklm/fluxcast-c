@@ -738,8 +738,8 @@ int main(int argc, char **argv) {
 
     printf("[FluxCast-C Loop] Streaming live at up to 60 FPS directly into TV hardware!\n");
 
-    // Initialize kernel real-time subsystem (locks memory, pre-faults stack, pins to core 2)
-    realtime_sys_init(2);
+    // Initialize kernel real-time subsystem (locks memory, pre-faults stack, pins to core 3)
+    realtime_sys_init(3);
     pipeline_telemetry_t g_telem;
     telemetry_init(&g_telem);
 
@@ -921,7 +921,6 @@ int main(int argc, char **argv) {
             }
             av_packet_unref(pkt);
         }
-        avio_flush(out_ctx->pb);
         clock_gettime(CLOCK_MONOTONIC, &t_stage_end);
         double total_hw_elapsed = realtime_sys_elapsed_us(&t_stage_start, &t_stage_end);
         if (total_hw_elapsed < 0.0) total_hw_elapsed = 0.0;
@@ -930,12 +929,12 @@ int main(int argc, char **argv) {
         if (t_upload_us > total_hw_elapsed) t_upload_us = total_hw_elapsed;
         double t_encode_us = total_hw_elapsed - t_upload_us;
 
-        // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
+        // Dynamically compute pacing budget: 16.666 ms - elapsed - 0.8 ms safety margin
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
         uint64_t elapsed_ns = (t_elapsed_frame_us > 0.0) ? (uint64_t)(t_elapsed_frame_us * 1000.0) : 0ULL;
         uint64_t frame_period_ns = 16666667ULL;
-        uint64_t safety_margin_ns = 2000000ULL;
+        uint64_t safety_margin_ns = 800000ULL;
         uint64_t budget_ns;
         if (elapsed_ns + safety_margin_ns < frame_period_ns) {
             budget_ns = frame_period_ns - elapsed_ns - safety_margin_ns;

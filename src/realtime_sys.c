@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <math.h>
 
 static int g_cpu_dma_latency_fd = -1;
@@ -41,6 +42,9 @@ int realtime_sys_init(int target_cpu_core) {
     memset(&g_rt_status, 0, sizeof(g_rt_status));
     g_rt_status.target_cpu_core = target_cpu_core;
     g_rt_status.cpu_dma_latency_fd = -1;
+
+    // Set timer slack to 1 ns to eliminate kernel timer wake grouping delay on timerfd and clock_nanosleep
+    prctl(PR_SET_TIMERSLACK, 1UL);
 
     // 1. Lock process memory to eliminate page fault jitter
     struct rlimit rlim;
