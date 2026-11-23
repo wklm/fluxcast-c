@@ -159,7 +159,6 @@ int video_enc_init(VideoEncoder *enc, const VideoEncConfig *config) {
     /* Use constant quantization without rate-control lookahead. */
     av_opt_set(c->priv_data, "rc_mode", "CQP", 0);
     av_opt_set(c->priv_data, "qp", qp_str, 0);
-    av_opt_set(c->priv_data, "rc_lookahead", "0", 0);
 
     /* Enforce recovery_point SEI: preserves sync recovery points needed by VIDAA OS
      * while stripping 500ms HRD compliance buffering delay */
