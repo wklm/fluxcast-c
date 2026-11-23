@@ -236,6 +236,66 @@ static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
     .buffer_done = frame_handle_buffer_done,
 };
 
+#define MAX_WAYLAND_OUTPUTS 8
+
+struct discovered_output {
+    uint32_t id;
+    struct wl_output *output;
+    char name[64];
+    char make[64];
+    char model[64];
+    int width;
+    int height;
+    bool done;
+};
+
+static struct discovered_output g_discovered_outputs[MAX_WAYLAND_OUTPUTS];
+static int g_num_discovered_outputs = 0;
+static char g_target_output[64] = {0};
+
+static void output_handle_geometry(void *data, struct wl_output *wl_output,
+                                   int32_t x, int32_t y,
+                                   int32_t physical_width, int32_t physical_height,
+                                   int32_t subpixel,
+                                   const char *make, const char *model,
+                                   int32_t transform) {
+    struct discovered_output *o = (struct discovered_output *)data;
+    if (make) strncpy(o->make, make, sizeof(o->make) - 1);
+    if (model) strncpy(o->model, model, sizeof(o->model) - 1);
+}
+
+static void output_handle_mode(void *data, struct wl_output *wl_output,
+                               uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
+    struct discovered_output *o = (struct discovered_output *)data;
+    if (flags & WL_OUTPUT_MODE_CURRENT) {
+        o->width = width;
+        o->height = height;
+    }
+}
+
+static void output_handle_done(void *data, struct wl_output *wl_output) {
+    struct discovered_output *o = (struct discovered_output *)data;
+    o->done = true;
+}
+
+static void output_handle_scale(void *data, struct wl_output *wl_output, int32_t factor) {}
+
+static void output_handle_name(void *data, struct wl_output *wl_output, const char *name) {
+    struct discovered_output *o = (struct discovered_output *)data;
+    if (name) strncpy(o->name, name, sizeof(o->name) - 1);
+}
+
+static void output_handle_description(void *data, struct wl_output *wl_output, const char *description) {}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_handle_geometry,
+    .mode = output_handle_mode,
+    .done = output_handle_done,
+    .scale = output_handle_scale,
+    .name = output_handle_name,
+    .description = output_handle_description,
+};
+
 static void registry_handle_global(void *data, struct wl_registry *registry,
         uint32_t name, const char *interface, uint32_t version) {
     struct wayland_context *ctx = (struct wayland_context *)data;
@@ -248,8 +308,15 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         ctx->dmabuf_mgr = wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, (version >= 3) ? 3 : version);
         zwp_linux_dmabuf_v1_add_listener(ctx->dmabuf_mgr, &dmabuf_listener, ctx);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
-        if (!ctx->output) {
-            ctx->output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+        if (g_num_discovered_outputs < MAX_WAYLAND_OUTPUTS) {
+            struct discovered_output *o = &g_discovered_outputs[g_num_discovered_outputs++];
+            memset(o, 0, sizeof(*o));
+            o->id = name;
+            uint32_t bind_ver = (version >= 4) ? 4 : (version >= 2 ? 2 : 1);
+            o->output = wl_registry_bind(registry, name, &wl_output_interface, bind_ver);
+            if (bind_ver >= 2) {
+                wl_output_add_listener(o->output, &output_listener, o);
+            }
         }
     }
 }
@@ -536,6 +603,8 @@ int main(int argc, char **argv) {
             g_local_rtp_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-dmabuf") == 0) {
             g_no_dmabuf = true;
+        } else if ((strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "--monitor") == 0 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
+            strncpy(g_target_output, argv[++i], sizeof(g_target_output) - 1);
         }
     }
 
@@ -566,12 +635,59 @@ int main(int argc, char **argv) {
     if (!g_wl.registry) goto error;
     wl_registry_add_listener(g_wl.registry, &registry_listener, &g_wl);
     wl_display_roundtrip(g_wl.display);
+    wl_display_roundtrip(g_wl.display);
+
+    int chosen_idx = -1;
+    if (g_target_output[0] != '\0') {
+        for (int i = 0; i < g_num_discovered_outputs; i++) {
+            if (strcmp(g_discovered_outputs[i].name, g_target_output) == 0 ||
+                strstr(g_discovered_outputs[i].model, g_target_output) ||
+                strstr(g_discovered_outputs[i].make, g_target_output)) {
+                chosen_idx = i;
+                break;
+            }
+        }
+        if (chosen_idx < 0) {
+            fprintf(stderr, "[FluxCast-C Wayland] Warning: Output '%s' not matched, falling back\n", g_target_output);
+        }
+    }
+    if (chosen_idx < 0) {
+        // Auto-select: Prefer external or virtual display (HDMI or non-eDP)
+        for (int i = 0; i < g_num_discovered_outputs; i++) {
+            if (strstr(g_discovered_outputs[i].name, "HDMI") != NULL ||
+                (g_discovered_outputs[i].name[0] != '\0' && strstr(g_discovered_outputs[i].name, "eDP") == NULL)) {
+                chosen_idx = i;
+                break;
+            }
+        }
+    }
+    if (chosen_idx < 0 && g_num_discovered_outputs > 0) {
+        chosen_idx = 0;
+    }
+
+    if (chosen_idx >= 0) {
+        g_wl.output = g_discovered_outputs[chosen_idx].output;
+        printf("[FluxCast-C Wayland] Capturing monitor: %s (%s %s) [%dx%d]\n",
+               g_discovered_outputs[chosen_idx].name[0] ? g_discovered_outputs[chosen_idx].name : "unknown",
+               g_discovered_outputs[chosen_idx].make,
+               g_discovered_outputs[chosen_idx].model,
+               g_discovered_outputs[chosen_idx].width,
+               g_discovered_outputs[chosen_idx].height);
+    }
+
+    // Destroy unused outputs
+    for (int i = 0; i < g_num_discovered_outputs; i++) {
+        if (i != chosen_idx && g_discovered_outputs[i].output) {
+            wl_output_destroy(g_discovered_outputs[i].output);
+            g_discovered_outputs[i].output = NULL;
+        }
+    }
 
     if (!g_wl.shm || !g_wl.screencopy_mgr || !g_wl.output) {
-        fprintf(stderr, "Error: Compositor missing required screencopy protocols\n");
+        fprintf(stderr, "Error: Compositor missing required screencopy protocols or output\n");
         goto error;
     }
-    printf("[FluxCast-C Wayland] Screencopy manager bound successfully.\n");
+    printf("[FluxCast-C Wayland] Screencopy manager and output bound successfully.\n");
 
     if (!g_stream_only) {
         int thread_err = pthread_create(&rtsp_th, NULL, rtsp_server_thread, NULL);
