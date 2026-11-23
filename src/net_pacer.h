@@ -21,7 +21,7 @@ extern "C" {
  * - Leaves 3.333 ms channel silence before next frame VSYNC.
  * - SO_PRIORITY = 6: Maps to AC_VO (Voice) in mac80211, clamping CW_max=7 and contention to <0.1 ms.
  * - IP_TOS = 0xC0: DSCP CS6 (Class Selector 6 / Network Control / Voice).
- * - SO_SNDBUF = 262144: enough capacity for paced IDR frames without blocking sends.
+ * - SO_SNDBUF = 65536: prevents bufferbloat (clamping buffering to < 25ms).
  * - Uses absolute CLOCK_MONOTONIC deadlines and reports departure/queue telemetry.
  */
 
@@ -32,7 +32,7 @@ extern "C" {
 
 #define NET_PACER_SO_PRIORITY               6            /* WMM Voice AC_VO */
 #define NET_PACER_IP_TOS                    0xC0         /* DSCP CS6 (Voice / Network Control) */
-#define NET_PACER_SO_SNDBUF                 262144       /* 256 KB requested; fits paced IDR bursts */
+#define NET_PACER_SO_SNDBUF                 65536        /* 64 KB requested; prevents bufferbloat (< 25ms) */
 
 #define NET_PACER_MAX_PACKET_SIZE           1500         /* Maximum Ethernet/UDP packet MTU */
 #define NET_PACER_MAX_FRAME_PACKETS         1024         /* Up to ~1.4 MB per frame */
