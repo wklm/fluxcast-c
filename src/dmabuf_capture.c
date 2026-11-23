@@ -19,7 +19,7 @@
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
-#define NUM_DMABUF_BUFFERS 2
+#define NUM_DMABUF_BUFFERS 3
 
 struct dmabuf_buffer {
     struct gbm_bo *bo;
@@ -374,8 +374,8 @@ int dmabuf_capture_convert_vpp(DmaBufCapture *cap, VASurfaceID dst_surface) {
 
     st = vaEndPicture(cap->va_dpy, cap->vpp_ctx);
 
-    // Advance buffer index for double buffering
-    cap->cur_buf ^= 1;
+    // Advance buffer index for triple buffering
+    cap->cur_buf = (cap->cur_buf + 1) % NUM_DMABUF_BUFFERS;
 
     return (st == VA_STATUS_SUCCESS) ? 0 : -EIO;
 }
