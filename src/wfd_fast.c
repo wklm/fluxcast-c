@@ -203,7 +203,7 @@ static void frame_handle_buffer(void *data, struct zwlr_screencopy_frame_v1 *fra
         ctx->frame_failed = true;
         return;
     }
-    zwlr_screencopy_frame_v1_copy_with_damage(frame, b->wl_buf);
+    zwlr_screencopy_frame_v1_copy(frame, b->wl_buf);
     ctx->copy_done = true;
 }
 
@@ -895,11 +895,6 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
-            roi_count = dmabuf_capture_get_rois(dmabuf_cap, rois, VIDEO_ENC_MAX_ROIS);
-            if (realtime_sys_elapsed_us(&t_frame_start, &t_stage_end) >
-                NET_PACER_FRAME_BUDGET_NS / 1000.0) {
-                t_frame_start = t_stage_end;
-            }
             pts = stream_next_pts(&t_stream_start, &last_pts);
 
             // Hardware VPP color conversion (XRGB -> NV12 in GPU hardware, ~0.24ms)
@@ -927,7 +922,7 @@ int main(int argc, char **argv) {
 
             // Hardware encode (Intel VDENC ASIC direct submit)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_hw_surface_with_rois(&venc, pts, rois, roi_count);
+            err = video_enc_send_hw_surface(&venc, pts);
             if (err < 0) {
                 static int hw_enc_err_cnt = 0;
                 if (++hw_enc_err_cnt % 60 == 1) {
@@ -1007,7 +1002,7 @@ int main(int argc, char **argv) {
 
             // Hardware encode (DMA upload + Intel VDENC ASIC)
             clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
-            err = video_enc_send_frame_with_rois(&venc, sw_frame, pts, rois, roi_count);
+            err = video_enc_send_frame(&venc, sw_frame, pts);
             if (err < 0) {
                 static int hw_buf_err_cnt = 0;
                 if (++hw_buf_err_cnt % 60 == 1) {
@@ -1046,12 +1041,12 @@ int main(int argc, char **argv) {
         if (t_upload_us > total_hw_elapsed) t_upload_us = total_hw_elapsed;
         double t_encode_us = total_hw_elapsed - t_upload_us;
 
-        // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.5 ms safety margin
+        // Dynamically compute pacing budget: 16.666 ms - elapsed - 2.0 ms safety margin
         clock_gettime(CLOCK_MONOTONIC, &t_stage_start);
         double t_elapsed_frame_us = realtime_sys_elapsed_us(&t_frame_start, &t_stage_start);
         uint64_t elapsed_ns = (t_elapsed_frame_us > 0.0) ? (uint64_t)(t_elapsed_frame_us * 1000.0) : 0ULL;
         uint64_t frame_period_ns = 16666667ULL;
-        uint64_t safety_margin_ns = 2500000ULL;
+        uint64_t safety_margin_ns = 2000000ULL;
         uint64_t budget_ns;
         if (elapsed_ns + safety_margin_ns < frame_period_ns) {
             budget_ns = frame_period_ns - elapsed_ns - safety_margin_ns;

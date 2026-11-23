@@ -332,7 +332,7 @@ int dmabuf_capture_frame(DmaBufCapture *cap) {
     if (!frame) return -EIO;
 
     zwlr_screencopy_frame_v1_add_listener(frame, &sc_listener, cap);
-    zwlr_screencopy_frame_v1_copy_with_damage(frame, buf->wl_buf);
+    zwlr_screencopy_frame_v1_copy(frame, buf->wl_buf);
 
     if (wl_display_flush(cap->display) < 0 && errno != EAGAIN && errno != EINTR) {
         zwlr_screencopy_frame_v1_destroy(frame);
